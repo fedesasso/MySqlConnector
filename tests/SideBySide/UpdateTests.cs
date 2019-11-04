@@ -23,7 +23,7 @@ namespace SideBySide
 		[InlineData(1, 2)]
 		[InlineData(2, 1)]
 		[InlineData(3, 0)]
-		[InlineData(4, 0)]
+		[InlineData(4, 1)]
 		public async Task UpdateRowsExecuteReader(int oldValue, int expectedRowsUpdated)
 		{
 			using (var cmd = m_database.Connection.CreateCommand())
@@ -47,12 +47,10 @@ insert into update_rows_reader (value) VALUES (1), (2), (1), (4);
 				p.Value = 4;
 				cmd.Parameters.Add(p);
 
-				using (var reader = await cmd.ExecuteReaderAsync().ConfigureAwait(false))
-				{
-					Assert.False(await reader.ReadAsync().ConfigureAwait(false));
-					Assert.Equal(expectedRowsUpdated, reader.RecordsAffected);
-					Assert.False(await reader.NextResultAsync().ConfigureAwait(false));
-				}
+				using var reader = await cmd.ExecuteReaderAsync().ConfigureAwait(false);
+				Assert.False(await reader.ReadAsync().ConfigureAwait(false));
+				Assert.Equal(expectedRowsUpdated, reader.RecordsAffected);
+				Assert.False(await reader.NextResultAsync().ConfigureAwait(false));
 			}
 		}
 
@@ -60,7 +58,7 @@ insert into update_rows_reader (value) VALUES (1), (2), (1), (4);
 		[InlineData(1, 2)]
 		[InlineData(2, 1)]
 		[InlineData(3, 0)]
-		[InlineData(4, 0)]
+		[InlineData(4, 1)]
 		public async Task UpdateRowsExecuteNonQuery(int oldValue, int expectedRowsUpdated)
 		{
 			using (var cmd = m_database.Connection.CreateCommand())
@@ -93,7 +91,7 @@ insert into update_rows_non_query (value) VALUES (1), (2), (1), (4);
 		[InlineData(1, 2)]
 		[InlineData(2, 1)]
 		[InlineData(3, 0)]
-		[InlineData(4, 0)]
+		[InlineData(4, 1)]
 		public void UpdateRowsDapper(int oldValue, int expectedRowsUpdated)
 		{
 			using (var cmd = m_database.Connection.CreateCommand())

@@ -1,13 +1,11 @@
 using System;
 using System.Buffers.Text;
+using System.Diagnostics.CodeAnalysis;
 using System.Globalization;
 using System.IO;
-using System.Linq;
 using System.Net;
 using System.Runtime.InteropServices;
-#if NET45 || NET461
 using System.Reflection;
-#endif
 using System.Security.Authentication;
 using System.Security.Cryptography;
 using System.Text;
@@ -17,19 +15,20 @@ namespace MySqlConnector.Utilities
 {
 	internal static class Utility
 	{
-		public static void Dispose<T>(ref T disposable)
+		public static void Dispose<T>(ref T? disposable)
 			where T : class, IDisposable
 		{
-			if (disposable != null)
+			if (disposable is object)
 			{
 				disposable.Dispose();
 				disposable = null;
 			}
 		}
 
-		public static string FormatInvariant(this string format, params object[] args) =>
+		public static string FormatInvariant(this string format, params object?[] args) =>
 			string.Format(CultureInfo.InvariantCulture, format, args);
 
+#if NET45 || NET461 || NET471 || NETSTANDARD1_3 || NETSTANDARD2_0
 		public static string GetString(this Encoding encoding, ReadOnlySpan<byte> span)
 		{
 			if (span.Length == 0)
@@ -39,137 +38,161 @@ namespace MySqlConnector.Utilities
 #else
 			unsafe
 			{
-				fixed (byte* ptr = span)
+				fixed (byte* ptr = &MemoryMarshal.GetReference(span))
 					return encoding.GetString(ptr, span.Length);
 			}
 #endif
 		}
 
-#if NET45 || NET461 || NETSTANDARD1_3 || NETSTANDARD2_0
 		public static unsafe void GetBytes(this Encoding encoding, ReadOnlySpan<char> chars, Span<byte> bytes)
 		{
-			fixed (char* charsPtr = chars)
-			fixed (byte* bytesPtr = bytes)
+			fixed (char* charsPtr = &MemoryMarshal.GetReference(chars))
+			fixed (byte* bytesPtr = &MemoryMarshal.GetReference(bytes))
 			{
 				encoding.GetBytes(charsPtr, chars.Length, bytesPtr, bytes.Length);
 			}
 		}
 #endif
 
-#if NET461 || NETSTANDARD2_0
+#if NET461 || NET471 || NETSTANDARD2_0
 		public static unsafe void Convert(this Encoder encoder, ReadOnlySpan<char> chars, Span<byte> bytes, bool flush, out int charsUsed, out int bytesUsed, out bool completed)
 		{
-			fixed (char* charsPtr = chars)
-			fixed (byte* bytesPtr = bytes)
+			fixed (char* charsPtr = &MemoryMarshal.GetReference(chars))
+			fixed (byte* bytesPtr = &MemoryMarshal.GetReference(bytes))
 			{
 				// MemoryMarshal.GetNonNullPinnableReference is internal, so fake it by using an invalid but non-null pointer; this
 				// prevents Convert from throwing an exception when the output buffer is empty
-				encoder.Convert(charsPtr, chars.Length, bytesPtr == null ? (byte*) 1 : bytesPtr, bytes.Length, flush, out charsUsed, out bytesUsed, out completed);
+				encoder.Convert(charsPtr, chars.Length, bytesPtr is null ? (byte*) 1 : bytesPtr, bytes.Length, flush, out charsUsed, out bytesUsed, out completed);
 			}
 		}
 #endif
 
 		/// <summary>
-		/// Loads a RSA public key from a PEM string. Taken from <a href="https://stackoverflow.com/a/32243171/23633">Stack Overflow</a>.
+		/// Loads a RSA key from a PEM string.
 		/// </summary>
-		/// <param name="publicKey">The public key, in PEM format.</param>
-		/// <returns>An RSA public key, or <c>null</c> on failure.</returns>
-		public static RSA DecodeX509PublicKey(string publicKey)
+		/// <param name="key">The key, in PEM format.</param>
+		/// <returns>An RSA key.</returns>
+		public static RSAParameters GetRsaParameters(string key)
 		{
-			var x509Key = System.Convert.FromBase64String(publicKey.Replace("-----BEGIN PUBLIC KEY-----", "").Replace("-----END PUBLIC KEY-----", ""));
-
-			// encoded OID sequence for  PKCS #1 rsaEncryption szOID_RSA_RSA = "1.2.840.113549.1.1.1"
-			byte[] seqOid = { 0x30, 0x0D, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01, 0x05, 0x00 };
-
-			// ---------  Set up stream to read the asn.1 encoded SubjectPublicKeyInfo blob  ------
-			using (var stream = new MemoryStream(x509Key))
-			using (var reader = new BinaryReader(stream)) //wrap Memory Stream with BinaryReader for easy reading
+			bool isPrivate;
+			if (key.StartsWith("-----BEGIN RSA PRIVATE KEY-----", StringComparison.Ordinal))
 			{
-				var temp = reader.ReadUInt16();
-				switch (temp)
-				{
-				case 0x8130:
-					reader.ReadByte(); //advance 1 byte
-					break;
-				case 0x8230:
-					reader.ReadInt16(); //advance 2 bytes
-					break;
-				default:
-					throw new FormatException("Expected 0x8130 or 0x8230 but read {0:X4}".FormatInvariant(temp));
-				}
-
-				var seq = reader.ReadBytes(15);
-				if (!seq.SequenceEqual(seqOid)) //make sure Sequence for OID is correct
-					throw new FormatException("Expected RSA OID but read {0}".FormatInvariant(BitConverter.ToString(seq)));
-
-				temp = reader.ReadUInt16();
-				if (temp == 0x8103) //data read as little endian order (actual data order for Bit String is 03 81)
-					reader.ReadByte(); //advance 1 byte
-				else if (temp == 0x8203)
-					reader.ReadInt16(); //advance 2 bytes
-				else
-					throw new FormatException("Expected 0x8130 or 0x8230 but read {0:X4}".FormatInvariant(temp));
-
-				var bt = reader.ReadByte();
-				if (bt != 0x00) //expect null byte next
-					throw new FormatException("Expected 0x00 but read {0:X2}".FormatInvariant(bt));
-
-				temp = reader.ReadUInt16();
-				if (temp == 0x8130) //data read as little endian order (actual data order for Sequence is 30 81)
-					reader.ReadByte(); //advance 1 byte
-				else if (temp == 0x8230)
-					reader.ReadInt16(); //advance 2 bytes
-				else
-					throw new FormatException("Expected 0x8130 or 0x8230 but read {0:X4}".FormatInvariant(temp));
-
-				temp = reader.ReadUInt16();
-				byte lowbyte;
-				byte highbyte = 0x00;
-
-				if (temp == 0x8102)
-				{
-					//data read as little endian order (actual data order for Integer is 02 81)
-					lowbyte = reader.ReadByte(); // read next bytes which is bytes in modulus
-				}
-				else if (temp == 0x8202)
-				{
-					highbyte = reader.ReadByte(); //advance 2 bytes
-					lowbyte = reader.ReadByte();
-				}
-				else
-				{
-					throw new FormatException("Expected 0x8102 or 0x8202 but read {0:X4}".FormatInvariant(temp));
-				}
-
-				var modulusSize = highbyte * 256 + lowbyte;
-
-				var firstbyte = reader.ReadByte();
-				reader.BaseStream.Seek(-1, SeekOrigin.Current);
-
-				if (firstbyte == 0x00)
-				{
-					//if first byte (highest order) of modulus is zero, don't include it
-					reader.ReadByte(); //skip this null byte
-					modulusSize -= 1; //reduce modulus buffer size by 1
-				}
-
-				var modulus = reader.ReadBytes(modulusSize); //read the modulus bytes
-
-				if (reader.ReadByte() != 0x02) //expect an Integer for the exponent data
-					throw new FormatException("Expected 0x02");
-				int exponentSize = reader.ReadByte(); // should only need one byte for actual exponent data (for all useful values)
-				var exponent = reader.ReadBytes(exponentSize);
-
-				// ------- create RSACryptoServiceProvider instance and initialize with public key -----
-				var rsa = RSA.Create();
-				var rsaKeyInfo = new RSAParameters
-				{
-					Modulus = modulus,
-					Exponent = exponent
-				};
-				rsa.ImportParameters(rsaKeyInfo);
-				return rsa;
+				key = key.Replace("-----BEGIN RSA PRIVATE KEY-----", "").Replace("-----END RSA PRIVATE KEY-----", "");
+				isPrivate = true;
 			}
+			else if (key.StartsWith("-----BEGIN PUBLIC KEY-----", StringComparison.Ordinal))
+			{
+				key = key.Replace("-----BEGIN PUBLIC KEY-----", "").Replace("-----END PUBLIC KEY-----", "");
+				isPrivate = false;
+			}
+			else
+			{
+				throw new FormatException("Unrecognized PEM header: " + key.Substring(0, Math.Min(key.Length, 80)));
+			}
+
+			return GetRsaParameters(System.Convert.FromBase64String(key), isPrivate);
+		}
+
+		// Derived from: https://stackoverflow.com/a/32243171/, https://stackoverflow.com/a/26978561/, http://luca.ntop.org/Teaching/Appunti/asn1.html
+		private static RSAParameters GetRsaParameters(ReadOnlySpan<byte> data, bool isPrivate)
+		{
+			// read header (30 81 xx, or 30 82 xx xx)
+			if (data[0] != 0x30)
+				throw new FormatException("Expected 0x30 but read {0:X2}".FormatInvariant(data[0]));
+			data = data.Slice(1);
+
+			if (!TryReadAsnLength(data, out var length, out var bytesConsumed))
+				throw new FormatException("Couldn't read key length");
+			data = data.Slice(bytesConsumed);
+
+			if (!isPrivate)
+			{
+				if (!data.Slice(0, s_rsaOid.Length).SequenceEqual(s_rsaOid))
+					throw new FormatException("Expected RSA OID but read {0}".FormatInvariant(BitConverter.ToString(data.Slice(0, 15).ToArray())));
+				data = data.Slice(s_rsaOid.Length);
+
+				// BIT STRING (0x03) followed by length
+				if (data[0] != 0x03)
+					throw new FormatException("Expected 0x03 but read {0:X2}".FormatInvariant(data[0]));
+				data = data.Slice(1);
+
+				if (!TryReadAsnLength(data, out length, out bytesConsumed))
+					throw new FormatException("Couldn't read length");
+				data = data.Slice(bytesConsumed);
+
+				// skip NULL byte
+				if (data[0] != 0x00)
+					throw new FormatException("Expected 0x00 but read {0:X2}".FormatInvariant(data[0]));
+				data = data.Slice(1);
+
+				// skip next header (30 81 xx, or 30 82 xx xx)
+				if (data[0] != 0x30)
+					throw new FormatException("Expected 0x30 but read {0:X2}".FormatInvariant(data[0]));
+				data = data.Slice(1);
+
+				if (!TryReadAsnLength(data, out length, out bytesConsumed))
+					throw new FormatException("Couldn't read length");
+				data = data.Slice(bytesConsumed);
+			}
+			else
+			{
+				if (!TryReadAsnInteger(data, out var zero, out bytesConsumed) || zero.Length != 1 || zero[0] != 0)
+					throw new FormatException("Couldn't read zero.");
+				data = data.Slice(bytesConsumed);
+			}
+
+			if (!TryReadAsnInteger(data, out var modulus, out bytesConsumed))
+				throw new FormatException("Couldn't read modulus");
+			data = data.Slice(bytesConsumed);
+
+			if (!TryReadAsnInteger(data, out var exponent, out bytesConsumed))
+				throw new FormatException("Couldn't read exponent");
+			data = data.Slice(bytesConsumed);
+
+			if (!isPrivate)
+			{
+				return new RSAParameters
+				{
+					Modulus = modulus.ToArray(),
+					Exponent = exponent.ToArray(),
+				};
+			}
+
+			if (!TryReadAsnInteger(data, out var d, out bytesConsumed))
+				throw new FormatException("Couldn't read D");
+			data = data.Slice(bytesConsumed);
+
+			if (!TryReadAsnInteger(data, out var p, out bytesConsumed))
+				throw new FormatException("Couldn't read P");
+			data = data.Slice(bytesConsumed);
+
+			if (!TryReadAsnInteger(data, out var q, out bytesConsumed))
+				throw new FormatException("Couldn't read Q");
+			data = data.Slice(bytesConsumed);
+
+			if (!TryReadAsnInteger(data, out var dp, out bytesConsumed))
+				throw new FormatException("Couldn't read DP");
+			data = data.Slice(bytesConsumed);
+
+			if (!TryReadAsnInteger(data, out var dq, out bytesConsumed))
+				throw new FormatException("Couldn't read DQ");
+			data = data.Slice(bytesConsumed);
+
+			if (!TryReadAsnInteger(data, out var iq, out bytesConsumed))
+				throw new FormatException("Couldn't read IQ");
+			data = data.Slice(bytesConsumed);
+
+			return new RSAParameters
+			{
+				Modulus = modulus.ToArray(),
+				Exponent = exponent.ToArray(),
+				D = d.ToArray(),
+				P = p.ToArray(),
+				Q = q.ToArray(),
+				DP = dp.ToArray(),
+				DQ = dq.ToArray(),
+				InverseQ = iq.ToArray(),
+			};
 		}
 
 		/// <summary>
@@ -179,7 +202,7 @@ namespace MySqlConnector.Utilities
 		/// <param name="index">The non-negative, zero-based starting index of the new slice (relative to <see cref="ArraySegment{T}.Offset"/> of <paramref name="arraySegment"/>.</param>
 		/// <returns>A new <see cref="ArraySegment{T}"/> starting at the <paramref name="index"/>th element of <paramref name="arraySegment"/> and continuing to the end of <paramref name="arraySegment"/>.</returns>
 		public static ArraySegment<T> Slice<T>(this ArraySegment<T> arraySegment, int index) =>
-			new ArraySegment<T>(arraySegment.Array, arraySegment.Offset + index, arraySegment.Count - index);
+			new ArraySegment<T>(arraySegment.Array!, arraySegment.Offset + index, arraySegment.Count - index);
 
 		/// <summary>
 		/// Returns a new <see cref="ArraySegment{T}"/> that starts at index <paramref name="index"/> into <paramref name="arraySegment"/> and has a length of <paramref name="length"/>.
@@ -189,14 +212,15 @@ namespace MySqlConnector.Utilities
 		/// <param name="length">The non-negative length of the new slice.</param>
 		/// <returns>A new <see cref="ArraySegment{T}"/> of length <paramref name="length"/>, starting at the <paramref name="index"/>th element of <paramref name="arraySegment"/>.</returns>
 		public static ArraySegment<T> Slice<T>(this ArraySegment<T> arraySegment, int index, int length) =>
-			new ArraySegment<T>(arraySegment.Array, arraySegment.Offset + index, length);
+			new ArraySegment<T>(arraySegment.Array!, arraySegment.Offset + index, length);
 
 		/// <summary>
-		/// Returns a new <see cref="byte[]"/> that is a slice of <paramref name="input"/> starting at <paramref name="offset"/>.
+		/// Returns a new <see cref="T:byte[]"/> that is a slice of <paramref name="input"/> starting at <paramref name="offset"/>.
 		/// </summary>
 		/// <param name="input">The array to slice.</param>
 		/// <param name="offset">The offset at which to slice.</param>
-		/// <returns>A new <see cref="byte[]"/> that is a slice of <paramref name="input"/> from <paramref name="offset"/> to the end.</returns>
+		/// <param name="length">The length of the slice.</param>
+		/// <returns>A new <see cref="T:byte[]"/> that is a slice of <paramref name="input"/> from <paramref name="offset"/> to the end.</returns>
 		public static byte[] ArraySlice(byte[] input, int offset, int length)
 		{
 			if (offset == 0 && length == input.Length)
@@ -234,10 +258,10 @@ namespace MySqlConnector.Utilities
 		/// Resizes <paramref name="resizableArray"/> to hold at least <paramref name="newLength"/> items.
 		/// </summary>
 		/// <remarks><paramref name="resizableArray"/> may be <c>null</c>, in which case a new <see cref="ResizableArray{T}"/> will be allocated.</remarks>
-		public static void Resize<T>(ref ResizableArray<T> resizableArray, int newLength)
+		public static void Resize<T>([NotNull] ref ResizableArray<T>? resizableArray, int newLength)
+			where T : notnull
 		{
-			if (resizableArray == null)
-				resizableArray = new ResizableArray<T>();
+			resizableArray ??= new ResizableArray<T>();
 			resizableArray.DoResize(newLength);
 		}
 
@@ -305,16 +329,16 @@ namespace MySqlConnector.Utilities
 		{
 			get
 			{
-				if (s_completedTask == null)
+				if (s_completedTask is null)
 				{
 					var tcs = new TaskCompletionSource<object>();
-					tcs.SetResult(null);
+					tcs.SetResult(tcs);
 					s_completedTask = tcs.Task;
 				}
 				return s_completedTask;
 			}
 		}
-		static Task s_completedTask;
+		static Task? s_completedTask;
 
 		public static Task TaskFromException(Exception exception) => TaskFromException<object>(exception);
 		public static Task<T> TaskFromException<T>(Exception exception)
@@ -323,10 +347,19 @@ namespace MySqlConnector.Utilities
 			tcs.SetException(exception);
 			return tcs.Task;
 		}
+
+		public static byte[] EmptyByteArray { get; } = new byte[0];
 #else
 		public static Task CompletedTask => Task.CompletedTask;
 		public static Task TaskFromException(Exception exception) => Task.FromException(exception);
 		public static Task<T> TaskFromException<T>(Exception exception) => Task.FromException<T>(exception);
+		public static byte[] EmptyByteArray { get; } = Array.Empty<byte>();
+#endif
+
+#if !NETSTANDARD2_1 && !NETCOREAPP3_0
+		public static Task CompletedValueTask => CompletedTask;
+#else
+		public static ValueTask CompletedValueTask => default;
 #endif
 
 		public static byte[] TrimZeroByte(byte[] value)
@@ -353,6 +386,36 @@ namespace MySqlConnector.Utilities
 		}
 #endif
 
+#if !NETSTANDARD2_1 && !NETCOREAPP2_1 && !NETCOREAPP3_0
+		public static int Read(this Stream stream, Memory<byte> buffer)
+		{
+			MemoryMarshal.TryGetArray<byte>(buffer, out var arraySegment);
+			return stream.Read(arraySegment.Array, arraySegment.Offset, arraySegment.Count);
+		}
+
+		public static Task<int> ReadAsync(this Stream stream, Memory<byte> buffer)
+		{
+			MemoryMarshal.TryGetArray<byte>(buffer, out var arraySegment);
+			return stream.ReadAsync(arraySegment.Array, arraySegment.Offset, arraySegment.Count);
+		}
+
+		public static void Write(this Stream stream, ReadOnlyMemory<byte> data)
+		{
+			MemoryMarshal.TryGetArray(data, out var arraySegment);
+			stream.Write(arraySegment.Array, arraySegment.Offset, arraySegment.Count);
+		}
+
+		public static Task WriteAsync(this Stream stream, ReadOnlyMemory<byte> data)
+		{
+			MemoryMarshal.TryGetArray(data, out var arraySegment);
+			return stream.WriteAsync(arraySegment.Array, arraySegment.Offset, arraySegment.Count);
+		}
+#else
+		public static int Read(this Stream stream, Memory<byte> buffer) => stream.Read(buffer.Span);
+
+		public static void Write(this Stream stream, ReadOnlyMemory<byte> data) => stream.Write(data.Span);
+#endif
+
 		public static void SwapBytes(byte[] bytes, int offset1, int offset2)
 		{
 			byte swap = bytes[offset1];
@@ -363,7 +426,7 @@ namespace MySqlConnector.Utilities
 #if NET45 || NET461
 		public static bool IsWindows() => Environment.OSVersion.Platform == PlatformID.Win32NT;
 
-		public static void GetOSDetails(out string os, out string osDescription, out string architecture)
+		public static void GetOSDetails(out string? os, out string osDescription, out string architecture)
 		{
 			os = Environment.OSVersion.Platform == PlatformID.Win32NT ? "Windows" :
 				Environment.OSVersion.Platform == PlatformID.Unix ? "Linux" :
@@ -385,7 +448,7 @@ namespace MySqlConnector.Utilities
 			}
 		}
 
-		public static void GetOSDetails(out string os, out string osDescription, out string architecture)
+		public static void GetOSDetails(out string? os, out string osDescription, out string architecture)
 		{
 			os = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "Windows" :
 				RuntimeInformation.IsOSPlatform(OSPlatform.Linux) ? "Linux" :
@@ -411,7 +474,7 @@ namespace MySqlConnector.Utilities
 				try
 				{
 					var property = typeof(ServicePointManager).GetProperty("DisableSystemDefaultTlsVersions", BindingFlags.NonPublic | BindingFlags.Static);
-					disableSystemDefaultTlsVersions = property == null || (property.GetValue(null) is bool b && b);
+					disableSystemDefaultTlsVersions = property is null || (property.GetValue(null) is bool b && b);
 				}
 				catch (Exception)
 				{
@@ -431,5 +494,71 @@ namespace MySqlConnector.Utilities
 #else
 		public static SslProtocols GetDefaultSslProtocols() => SslProtocols.None;
 #endif
+
+		// Reads a length encoded according to ASN.1 BER rules.
+		private static bool TryReadAsnLength(ReadOnlySpan<byte> data, out int length, out int bytesConsumed)
+		{
+			var leadByte = data[0];
+			if (leadByte < 0x80)
+			{
+				// Short form. One octet. Bit 8 has value "0" and bits 7-1 give the length.
+				length = leadByte;
+				bytesConsumed = 1;
+				return true;
+			}
+
+			// Long form. Two to 127 octets. Bit 8 of first octet has value "1" and bits 7-1 give the number of additional length octets. Second and following octets give the length, base 256, most significant digit first.
+			if (leadByte == 0x81)
+			{
+				length = data[1];
+				bytesConsumed = 2;
+				return true;
+			}
+
+			if (leadByte == 0x82)
+			{
+				length = data[1] * 256 + data[2];
+				bytesConsumed = 3;
+				return true;
+			}
+
+			// lengths over 2^16 are not currently handled
+			length = 0;
+			bytesConsumed = 0;
+			return false;
+		}
+
+		private static bool TryReadAsnInteger(ReadOnlySpan<byte> data, out ReadOnlySpan<byte> number, out int bytesConsumed)
+		{
+			// integer tag is 2
+			if (data[0] != 0x02)
+			{
+				number = default;
+				bytesConsumed = 0;
+				return false;
+			}
+			data = data.Slice(1);
+
+			// tag is followed by the length of the integer
+			if (!TryReadAsnLength(data, out var length, out var lengthBytesConsumed))
+			{
+				number = default;
+				bytesConsumed = 0;
+				return false;
+			}
+
+			// length is followed by the integer bytes, MSB first
+			number = data.Slice(lengthBytesConsumed, length);
+			bytesConsumed = lengthBytesConsumed + length + 1;
+
+			// trim leading zero bytes
+			while (number.Length > 1 && number[0] == 0)
+				number = number.Slice(1);
+
+			return true;
+		}
+
+		// encoded OID sequence for  PKCS #1 rsaEncryption szOID_RSA_RSA = "1.2.840.113549.1.1.1"
+		private static ReadOnlySpan<byte> s_rsaOid => new byte[] { 0x30, 0x0D, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x01, 0x01, 0x05, 0x00 };
 	}
 }

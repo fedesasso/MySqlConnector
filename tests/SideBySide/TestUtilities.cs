@@ -85,11 +85,20 @@ namespace SideBySide
 				return "Requires SslMode=Required or lower in connection string";
 			}
 
-			if (configSettings.HasFlag(ConfigSettings.KnownClientCertificate) && !(csb.CertificateFile?.EndsWith("ssl-client.pfx", StringComparison.OrdinalIgnoreCase) ?? false))
-				return "Requires CertificateFile=client.pfx in connection string";
+			if (configSettings.HasFlag(ConfigSettings.KnownClientCertificate))
+			{
+				if (!((csb.CertificateFile?.EndsWith("ssl-client.pfx", StringComparison.OrdinalIgnoreCase) ?? false) || (csb.SslKey?.EndsWith("ssl-client-key.pem", StringComparison.OrdinalIgnoreCase) ?? false)))
+					return "Requires CertificateFile=client.pfx in connection string";
+			}
 
 			if (configSettings.HasFlag(ConfigSettings.PasswordlessUser) && string.IsNullOrWhiteSpace(AppConfig.PasswordlessUser))
 				return "Requires PasswordlessUser in config.json";
+
+			if (configSettings.HasFlag(ConfigSettings.GSSAPIUser) && string.IsNullOrWhiteSpace(AppConfig.GSSAPIUser))
+				return "Requires GSSAPIUser in config.json";
+
+			if (configSettings.HasFlag(ConfigSettings.HasKerberos) && !AppConfig.HasKerberos)
+				return "Requires HasKerberos in config.json";
 
 			if (configSettings.HasFlag(ConfigSettings.CsvFile) && string.IsNullOrWhiteSpace(AppConfig.MySqlBulkLoaderCsvFile))
 				return "Requires MySqlBulkLoaderCsvFile in config.json";

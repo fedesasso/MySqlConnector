@@ -1,16 +1,24 @@
 ---
-lastmod: 2018-08-21
+lastmod: 2019-08-21
 date: 2016-10-16
 title: Connection Options
+customtitle: MySQL Connection String for C#/.NET Programs
 weight: 30
 menu:
   main:
 ---
 
-Connection Options
-==================
+# MySQL ConnectionString Options
 
-MySqlConnector supports a subset of Oracle's [Connector/NET connection options](https://dev.mysql.com/doc/connector-net/en/connector-net-connection-options.html).
+The simplest MySQL connection string for C# is:
+
+`new MySqlConnection("server=YOURSERVER;user=YOURUSERID;password=YOURPASSWORD")`
+
+For all the other options, see the tables below. MySqlConnector supports most of Oracle’s
+[Connector/NET connection options](https://dev.mysql.com/doc/connector-net/en/connector-net-8-0-connection-options.html).
+
+There are also several unique options that are supported only by MySqlConnector, a replacement for `MySql.Data` that [fixes bugs](/tutorials/migrating-from-connector-net/#fixed-bugs),
+adds new features, and improves database access performance. [Install it now](/overview/installing/).
 
 Base Options
 ------------
@@ -93,7 +101,7 @@ These are the options that need to be used in order to configure a connection to
   <tr>
     <td>Certificate File, CertificateFile</td>
     <td></td>
-    <td>Specifies the path to a certificate file in PKCS #12 (.pfx) format containing a bundled Certificate and Private Key used for Mutual Authentication.  To create a PKCS #12 bundle from a PEM encoded Certificate and Key, use <code>openssl pkcs12 -in cert.pem -inkey key.pem -export -out bundle.pfx</code></td>
+    <td>Specifies the path to a certificate file in PKCS #12 (.pfx) format containing a bundled Certificate and Private Key used for Mutual Authentication.  To create a PKCS #12 bundle from a PEM encoded Certificate and Key, use <code>openssl pkcs12 -in cert.pem -inkey key.pem -export -out bundle.pfx</code>. This option should not be specified if <code>SslCert</code> and <code>SslKey</code> are used.</td>
   </tr>
   <tr>
     <td>Certificate Password, CertificatePassword</td>
@@ -101,9 +109,19 @@ These are the options that need to be used in order to configure a connection to
     <td>Specifies the password for the certificate specified using the <code>CertificateFile</code> option. Not required if the certificate file is not password protected.</td>
   </tr>
   <tr>
-    <td>CA Certificate File, CACertificateFile</td>
+    <td>SslCert, Ssl-Cert</td>
     <td></td>
-    <td>This option specifies the path to a CA certificate file in a PEM Encoded (.pem) format. This should be used in with <code>SslMode=VerifyCA</code> or <code>SslMode=VerifyFull</code> to enable verification of a CA certificate that is not trusted by the Operating System's certificate store.</td>
+    <td>Specifies the path to the client’s SSL certificate file in PEM format. <code>SslKey</code> must also be specified, and <code>CertificateFile</code> should not be. This option is not supported on the <code>netstandard1.3</code> or <code>netstandard2.0</code> platforms.</td>
+  </tr>
+  <tr>
+    <td>SslKey, Ssl-Key</td>
+    <td></td>
+    <td>Specifies the path to the client’s SSL private key in PEM format. <code>SslCert</code> must also be specified, and <code>CertificateFile</code> should not be.</td>
+  </tr>
+  <tr>
+    <td>CA Certificate File, CACertificateFile, SslCa, Ssl-Ca</td>
+    <td></td>
+    <td>This option specifies the path to a CA certificate file in a PEM Encoded (.pem) format. This should be used with <code>SslMode=VerifyCA</code> or <code>SslMode=VerifyFull</code> to enable verification of a CA certificate that is not trusted by the Operating System’s certificate store.</td>
   </tr>
   <tr>
     <td>Certificate Store Location, CertificateStoreLocation</td>
@@ -136,12 +154,12 @@ Connection pooling is enabled by default. These options are used to configure it
   <tr>
     <td>Connection Lifetime, ConnectionLifeTime</td>
     <td>0</td>
-    <td>Controls the maximum length of time a connection to the server can be open. Connections that are returned to the pool are destroyed if it's been more than <code>ConnectionLifeTime</code> seconds since the connection was created. The default value of zero (0) means pooled connections will never incur a ConnectionLifeTime timeout.</td>
+    <td>Controls the maximum length of time a connection to the server can be open. Connections that are returned to the pool are destroyed if it’s been more than <code>ConnectionLifeTime</code> seconds since the connection was created. The default value of zero (0) means pooled connections will never incur a ConnectionLifeTime timeout.</td>
   </tr>
   <tr>
     <td>Connection Reset, ConnectionReset</td>
     <td><code>true</code></td>
-    <td>If <code>true</code>, the connection state is reset when it is retrieved from the pool. The default value of <code>true</code> ensures that the connection is in the same state whether it's newly created or retrieved from the pool. A value of <code>false</code> avoids making an additional server round trip when obtaining a connection, but the connection state is not reset, meaning that session variables and other session state changes from any previous use of the connection are carried over.</td>
+    <td>If <code>true</code>, the connection state is reset when it is retrieved from the pool. The default value of <code>true</code> ensures that the connection is in the same state whether it’s newly created or retrieved from the pool. A value of <code>false</code> avoids making an additional server round trip when obtaining a connection, but the connection state is not reset, meaning that session variables and other session state changes from any previous use of the connection are carried over.</td>
   </tr>
   <tr>
     <td>Connection Idle Ping Time, Connection Idle Ping Time <em>(Experimental)</em></td>
@@ -173,6 +191,20 @@ Connection pooling is enabled by default. These options are used to configure it
   </tr>
 </table>
 
+### Connection Pooling with Multiple Servers
+
+The `Server` option supports multiple comma-delimited host names. When this is used with connection
+pooling, the `LoadBalance` option controls how load is distributed across backend servers.
+
+* `RoundRobin` (default), `Random`: A total of `MaximumPoolSize` connections will be opened, but they
+may be unevenly distributed across back ends.
+* `LeastConnections`: A total of `MaximumPoolSize` connections will be opened, and they will be evenly
+distributed across back ends. The active connections will be selected from the pool in least-recently-used
+order, which does not ensure even load across the back ends. You should set `MaximumPoolSize` to the
+number of servers multiplied by the desired maximum number of open connections per backend server.
+* `Failover`: All connections will initially be made to the first server in the list. You should set `MaximumPoolSize`
+to the maximum number of open connections you want per server.
+
 Other Options
 -------------
 
@@ -185,10 +217,18 @@ These are the other options that MySqlConnector supports. They are set to sensib
     <th style="width: 70%">Description</th>
   </thead>
   <tr>
+    <td>AllowLoadLocalInfile, Allow Load Local Infile</td>
+    <td>false</td>
+    <td>Allows the <code>LOAD DATA LOCAL</code> command to request files from the client. This is disabled by
+      default as a <a href="/troubleshooting/load-data-local-infile/" title="Using Load Data Local Infile">security precaution</a>.
+      In order to use <code>MySqlBulkLoader</code> and set its <code>Local</code> property to <code>true</code>, you
+      must set this option to <code>True</code> in  your connection string.</td>
+  </tr>
+  <tr>
     <td>AllowPublicKeyRetrieval, Allow Public Key Retrieval</td>
     <td>false</td>
     <td>If the user account uses <code>sha256_password</code> authentication, the password must be protected during transmission; TLS is the preferred mechanism for this,
-      but if it is not available then RSA public key encryption will be used. To specify the server's RSA public key, use the <code>ServerRSAPublicKeyFile</code> connection
+      but if it is not available then RSA public key encryption will be used. To specify the server’s RSA public key, use the <code>ServerRSAPublicKeyFile</code> connection
       string setting, or set <code>AllowPublicKeyRetrieval=True</code> to allow the client to automatically request the public key from the server. Note that <code>AllowPublicKeyRetrieval=True</code>
       could allow a malicious proxy to perform a MITM attack to get the plaintext password, so it is <code>False</code> by default and must be explicitly enabled.</td>
   </tr>
@@ -201,9 +241,9 @@ These are the other options that MySqlConnector supports. They are set to sensib
   <tr>
     <td>AllowZeroDateTime, Allow Zero DateTime</td>
     <td>false</td>
-    <td>If set to <c>true</c> all `DATE`, `DATETIME` and `TIMESTAMP` columns are returned as `MySqlDateTime` objects instead of `DateTime`.
-    This allows the special “zero” date value `0000-00-00` to be retrieved from the database. If <code>false</code> (the default)
-    date columns are returned as `DateTime` values, and an exception is thrown for unrepresentable dates.</td>
+    <td>If set to <c>true</c> all <code>DATE</code>, <code>DATETIME</code> and <code>TIMESTAMP</code> columns are returned as <code>MySqlDateTime</code> objects instead of <code>DateTime</code>.
+    This allows the special “zero” date value <code>0000-00-00</code> to be retrieved from the database. If <code>false</code> (the default)
+    date columns are returned as <code>DateTime</code> values, and an exception is thrown for unrepresentable dates.</td>
   </tr>
   <tr>
     <td>ApplicationName, Application Name</td>
@@ -212,11 +252,16 @@ These are the other options that MySqlConnector supports. They are set to sensib
     e.g., as the “Program” column in “Client Connections” in <a href="https://www.mysql.com/products/workbench/">MySQL Workbench</a>.</td>
   </tr>
   <tr>
+    <td>CharSet, Character Set, CharacterSet</td>
+    <td>utf8mb4</td>
+    <td>MySqlConnector always uses <code>utf8mb4</code> to send and receive strings from MySQL Server. This option may be specified (for backwards compatibility) but it will be ignored.</td>
+  </tr>
+  <tr>
     <td>Compress, Use Compression, UseCompression</td>
     <td>false</td>
     <td>If true (and if the server supports compression), compresses packets sent between client and server. This option is unlikely to be useful in
       practice unless there is a high-latency or low-bandwidth network link between the application and the database server. You should measure
-      performance with and without this option to determine if it's beneficial in your environment.</td>
+      performance with and without this option to determine if it’s beneficial in your environment.</td>
   </tr>
   <tr>
     <td>Connect Timeout, Connection Timeout, ConnectionTimeout</td>
@@ -226,7 +271,7 @@ These are the other options that MySqlConnector supports. They are set to sensib
   <tr>
     <td>Convert Zero Datetime, ConvertZeroDateTime</td>
     <td>false</td>
-    <td>True to have MySqlDataReader.GetValue() and MySqlDataReader.GetDateTime() return DateTime.MinValue for date or datetime columns that have disallowed values.</td>
+    <td>True to have <code>MySqlDataReader.GetValue()</code> and <code>MySqlDataReader.GetDateTime()</code> return <code>DateTime.MinValue</code> for date or datetime columns that have disallowed values.</td>
   </tr>
   <tr>
     <td>DateTimeKind</td>
@@ -269,7 +314,7 @@ These are the other options that MySqlConnector supports. They are set to sensib
     <td>IgnoreCommandTransaction, Ignore Command Transaction</td>
     <td>false</td>
     <td>If <code>true</code>, the value of <code>MySqlCommand.Transaction</code> is ignored when commands are executed.
-    This matches the Connector/NET behaviour and can make porting code easier. For more information, see <a href="https://github.com/mysql-net/MySqlConnector/issues/474">Issue 474</a>.</td>
+    This matches the Connector/NET behaviour and can make porting code easier. For more information, see <a href="troubleshooting/transaction-usage/">Transaction Usage</a>.</td>
   </tr>
   <tr>
     <td>Interactive, Interactive Session, InteractiveSession</td>
@@ -300,6 +345,11 @@ These are the other options that MySqlConnector supports. They are set to sensib
       </dl>
   </tr>
   <tr>
+    <td>No Backslash Escapes, NoBackslashEscapes</td>
+    <td>false</td>
+    <td>If <code>true</code>, backslashes are not escaped in string parameters. Set this to <code>true</code> if the server’s SQL mode includes <a href="https://dev.mysql.com/doc/refman/8.0/en/sql-mode.html#sqlmode_no_backslash_escapes"><code>NO_BACKSLASH_ESCAPES</code></a>.</td>
+  </tr>
+  <tr>
     <td>Old Guids, OldGuids</td>
     <td>false</td>
     <td>Obsolete; use the <code>GuidFormat</code> option instead.</td>
@@ -307,7 +357,7 @@ These are the other options that MySqlConnector supports. They are set to sensib
   <tr>
     <td>Persist Security Info, PersistSecurityInfo</td>
     <td>false</td>
-    <td>When set to false or no (strongly recommended), security-sensitive information, such as the password, is not returned as part of the connection if the connection is open or has ever been in an open state. Resetting the connection string resets all connection string values, including the password. Recognized values are true, false, yes, and no.</td>
+    <td>When set to <code>false</code> or no (strongly recommended), security-sensitive information, such as the password, is not returned as part of the connection string if the connection is open or has ever been in an open state. Resetting the connection string resets all connection string values, including the password. Recognized values are true, false, yes, and no.</td>
   </tr>
   <tr>
     <td>ServerRSAPublicKeyFile, Server RSA Public Key File</td>
@@ -315,13 +365,121 @@ These are the other options that MySqlConnector supports. They are set to sensib
     <td>For <code>sha256_password</code> authentication. See comments under <code>AllowPublicKeyRetrieval</code>.</td>
   </tr>
   <tr>
+    <td>ServerSPN, Server SPN</td>
+    <td></td>
+    <td>For MariaDB <a href="https://mariadb.com/kb/en/library/authentication-plugin-gssapi/"><code>auth_gssapi_client</code></a> authentication. Specifies the server’s Service Principal Name (to verify that authentication is occurring with the correct server).</td>
+  </tr>
+  <tr>
     <td>Treat Tiny As Boolean, TreatTinyAsBoolean</td>
     <td>true</td>
-    <td>When set to true, tinyint(1) values are returned as booleans. Setting this to false causes tinyint(1) to be returned as sbyte/byte.</td>
+    <td>When set to <code>true</code>, <code>TINYINT(1)</code> values are returned as booleans. Setting this to <code>false</code> causes <code>TINYINT(1)</code> to be returned as sbyte/byte.</td>
   </tr>
   <tr>
     <td>Use Affected Rows, UseAffectedRows</td>
+    <td>false</td>
+    <td>When <code>false</code> (default), the connection reports found rows instead of changed (affected) rows. Set to <code>true</code> to report only the number of rows actually changed by <code>UPDATE</code> or <code>INSERT … ON DUPLICATE KEY UPDATE</code> statements.</td>
+  </tr>
+  <tr>
+    <td>Use XA Transactions, UseXaTransactions</td>
     <td>true</td>
-    <td>When false, the connection reports found rows instead of changed (affected) rows.</td>
+    <td>When <code>true</code> (default), using <code>TransactionScope</code> or <code>MySqlConnection.EnlistTransaction</code>
+    will use a <a href="https://dev.mysql.com/doc/refman/8.0/en/xa.html">XA Transaction</a>. This allows true
+    distributed transactions, but may not be compatible with server replication; there are <a href="https://dev.mysql.com/doc/refman/8.0/en/xa-restrictions.html">other limitations</a>.
+    When set to <code>false</code>, regular MySQL transactions are used, just like Connector/NET.</td>
+  </tr>
+</table>
+
+
+Unsupported Options
+-------------
+
+These options are used by Connector/NET but not supported by MySqlConnector. In general, they should be removed
+from your connection string when migrating from Connector/NET to MySqlConnector.
+
+<table class="table table-striped table-hover">
+  <thead>
+    <th style="width: 20%">Name</th>
+    <th style="width: 10%">Default</th>
+    <th style="width: 70%">Description</th>
+  </thead>
+  <tr>
+    <td>AllowBatch, Allow Batch</td>
+    <td>true</td>
+    <td>MySqlConnector always allows batch statements.</td>
+  </tr>
+  <tr>
+    <td>CheckParameters, Check Parameters</td>
+    <td>true</td>
+    <td>MySqlConnector always checks stored procedure parameters efficiently; there’s no need to disable this.</td>
+  </tr>
+  <tr>
+    <td>CommandInterceptors, Command Interceptors</td>
+    <td></td>
+    <td>MySqlConnector doesn’t support this extensibility mechanism, which is not compatible with async operations.</td>
+  </tr>
+  <tr>
+    <td>ExceptionInterceptors, Exception Interceptors</td>
+    <td></td>
+    <td>MySqlConnector doesn’t support this extensibility mechanism.</td>
+  </tr>
+  <tr>
+    <td>FunctionsReturnString, Functions Return String</td>
+    <td>false</td>
+    <td>Not supported. BLOBs are always returned as <code>byte[]</code>.</td>
+  </tr>
+  <tr>
+    <td>IncludeSecurityAsserts, Include Security Asserts</td>
+    <td>false</td>
+    <td>Not supported. For partial trust environments.</td>
+  </tr>
+  <tr>
+    <td>IntegratedSecurity, Integrated Security</td>
+    <td>false</td>
+    <td>Windows authentication is not supported.</td>
+  </tr>
+  <tr>
+    <td>Logging</td>
+    <td>false</td>
+    <td>Use <a href="/overview/logging/">MySqlConnector logging</a> (which is more flexible) instead.</td>
+  </tr>
+  <tr>
+    <td>OldSyntax, Old Syntax, UseOldSyntax, Use Old Syntax</td>
+    <td>false</td>
+    <td>This option is deprecated in Connector/NET and unsupported in MySqlConnector.</td>
+  </tr>
+  <tr>
+    <td>ProcedureCacheSize, Procedure Cache Size, ProcedureCache, Procedure Cache</td>
+    <td></td>
+    <td>MySqlConnector places no limit on the amount of stored procedure metadata that is cached. It takes a very small amount of memory.</td>
+  </tr>
+  <tr>
+    <td>RespectBinaryFlags, Respect Binary Flags</td>
+    <td>true</td>
+    <td>The binary type of a column is always respected.</td>
+  </tr>
+  <tr>
+    <td>SharedMemoryName, Shared Memory Name</td>
+    <td>true</td>
+    <td>Shared memory (on Windows) is not supported as a connection protocol.</td>
+  </tr>
+  <tr>
+    <td>SqlServerMode, Sql Server Mode</td>
+    <td>false</td>
+    <td>Not supported.</td>
+  </tr>
+  <tr>
+    <td>TreatBlobsAsUtf8, Treat BLOBs as UTF8</td>
+    <td>false</td>
+    <td>Not supported. BLOBs are always returned as <code>byte[]</code>.</td>
+  </tr>
+  <tr>
+    <td>UsePerformanceMonitor, Use Performance Monitor, UserPerfMon, PerfMon</td>
+    <td>false</td>
+    <td>Not supported.</td>
+  </tr>
+  <tr>
+    <td>UseUsageAdvisor, Use Usage Advisor, Usage Advisor</td>
+    <td>false</td>
+    <td>Not supported.</td>
   </tr>
 </table>

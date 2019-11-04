@@ -1,4 +1,7 @@
 using System;
+using System.Buffers.Text;
+using System.IO;
+using System.Runtime.InteropServices;
 using MySql.Data.MySqlClient;
 using MySql.Data.Types;
 using MySqlConnector.Protocol;
@@ -9,35 +12,30 @@ namespace MySqlConnector.Core
 {
 	internal abstract class Row
 	{
-		public void SetData(ArraySegment<byte> data)
+		public void SetData(ReadOnlyMemory<byte> data)
 		{
 			m_data = data;
-			if (m_dataOffsets == null)
-			{
-				m_dataOffsets = new int[ResultSet.ColumnDefinitions.Length];
-				m_dataLengths = new int[ResultSet.ColumnDefinitions.Length];
-			}
-			GetDataOffsets(m_data.AsSpan(), m_dataOffsets, m_dataLengths);
+			GetDataOffsets(m_data.Span, m_dataOffsets, m_dataLengths!);
 		}
 
 		public Row Clone()
 		{
 			var clonedRow = CloneCore();
-			var clonedData = new byte[m_data.Count];
-			Buffer.BlockCopy(m_data.Array, m_data.Offset, clonedData, 0, m_data.Count);
-			clonedRow.SetData(new ArraySegment<byte>(clonedData));
+			var clonedData = new byte[m_data.Length];
+			m_data.CopyTo(clonedData);
+			clonedRow.SetData(clonedData);
 			return clonedRow;
 		}
 
 		public object GetValue(int ordinal)
 		{
-			if (ordinal < 0 || ordinal > ResultSet.ColumnDefinitions.Length)
-				throw new ArgumentOutOfRangeException(nameof(ordinal), "value must be between 0 and {0}.".FormatInvariant(ResultSet.ColumnDefinitions.Length));
+			if (ordinal < 0 || ordinal > ResultSet.ColumnDefinitions!.Length)
+				throw new ArgumentOutOfRangeException(nameof(ordinal), "value must be between 0 and {0}.".FormatInvariant(ResultSet.ColumnDefinitions!.Length));
 
 			if (m_dataOffsets[ordinal] == -1)
 				return DBNull.Value;
 
-			var data = new ReadOnlySpan<byte>(m_data.Array, m_data.Offset + m_dataOffsets[ordinal], m_dataLengths[ordinal]);
+			var data = m_data.Slice(m_dataOffsets[ordinal], m_dataLengths[ordinal]).Span;
 			var columnDefinition = ResultSet.ColumnDefinitions[ordinal];
 			return GetValueCore(data, columnDefinition);
 		}
@@ -64,29 +62,66 @@ namespace MySqlConnector.Core
 				return (long) value != 0;
 			if (value is ulong)
 				return (ulong) value != 0;
+			if (value is decimal)
+				return (decimal) value != 0;
 			return (bool) value;
 		}
 
-		public sbyte GetSByte(int ordinal) => (sbyte) GetValue(ordinal);
-
-		public byte GetByte(int ordinal) => (byte) GetValue(ordinal);
-
-		public long GetBytes(int ordinal, long dataOffset, byte[] buffer, int bufferOffset, int length)
+		public sbyte GetSByte(int ordinal)
 		{
-			if (m_dataOffsets[ordinal] == -1)
-				throw new InvalidCastException("Column is NULL.");
+			var value = GetValue(ordinal);
+			if (value is sbyte sbyteValue)
+				return sbyteValue;
 
-			var column = ResultSet.ColumnDefinitions[ordinal];
-			var columnType = column.ColumnType;
-			if ((column.ColumnFlags & ColumnFlags.Binary) == 0 ||
-				(columnType != ColumnType.String && columnType != ColumnType.VarString && columnType != ColumnType.TinyBlob &&
-				columnType != ColumnType.Blob && columnType != ColumnType.MediumBlob && columnType != ColumnType.LongBlob &&
-				columnType != ColumnType.Geometry))
-			{
-				throw new InvalidCastException("Can't convert {0} to bytes.".FormatInvariant(columnType));
-			}
+			if (value is byte byteValue)
+				return checked((sbyte) byteValue);
+			if (value is short shortValue)
+				return checked((sbyte) shortValue);
+			if (value is ushort ushortValue)
+				return checked((sbyte) ushortValue);
+			if (value is int intValue)
+				return checked((sbyte) intValue);
+			if (value is uint uintValue)
+				return checked((sbyte) uintValue);
+			if (value is long longValue)
+				return checked((sbyte) longValue);
+			if (value is ulong ulongValue)
+				return checked((sbyte) ulongValue);
+			if (value is decimal decimalValue)
+				return (sbyte) decimalValue;
+			return (sbyte) value;
+		}
 
-			if (buffer == null)
+		public byte GetByte(int ordinal)
+		{
+			var value = GetValue(ordinal);
+			if (value is byte byteValue)
+				return byteValue;
+
+			if (value is sbyte sbyteValue)
+				return checked((byte) sbyteValue);
+			if (value is short shortValue)
+				return checked((byte) shortValue);
+			if (value is ushort ushortValue)
+				return checked((byte) ushortValue);
+			if (value is int intValue)
+				return checked((byte) intValue);
+			if (value is uint uintValue)
+				return checked((byte) uintValue);
+			if (value is long longValue)
+				return checked((byte) longValue);
+			if (value is ulong ulongValue)
+				return checked((byte) ulongValue);
+			if (value is decimal decimalValue)
+				return (byte) decimalValue;
+			return (byte) value;
+		}
+
+		public long GetBytes(int ordinal, long dataOffset, byte[]? buffer, int bufferOffset, int length)
+		{
+			CheckBinaryColumn(ordinal);
+
+			if (buffer is null)
 			{
 				// this isn't required by the DbDataReader.GetBytes API documentation, but is what mysql-connector-net does
 				// (as does SqlDataReader: http://msdn.microsoft.com/en-us/library/system.data.sqlclient.sqldatareader.getbytes.aspx)
@@ -97,7 +132,8 @@ namespace MySqlConnector.Core
 
 			var offset = (int) dataOffset;
 			var lengthToCopy = Math.Max(0, Math.Min(m_dataLengths[ordinal] - offset, length));
-			Buffer.BlockCopy(m_data.Array, m_data.Offset + m_dataOffsets[ordinal] + offset, buffer, bufferOffset, lengthToCopy);
+			if (lengthToCopy > 0)
+				m_data.Slice(m_dataOffsets[ordinal] + offset, lengthToCopy).Span.CopyTo(buffer.AsSpan().Slice(bufferOffset));
 			return lengthToCopy;
 		}
 
@@ -107,10 +143,10 @@ namespace MySqlConnector.Core
 			return stringValue.Length > 0 ? stringValue[0] : throw new InvalidCastException();
 		}
 
-		public long GetChars(int ordinal, long dataOffset, char[] buffer, int bufferOffset, int length)
+		public long GetChars(int ordinal, long dataOffset, char[]? buffer, int bufferOffset, int length)
 		{
 			var value = GetString(ordinal);
-			if (buffer == null)
+			if (buffer is null)
 				return value.Length;
 
 			CheckBufferArguments(dataOffset, buffer, bufferOffset, length);
@@ -287,9 +323,23 @@ namespace MySqlConnector.Core
 			return (ulong) value;
 		}
 
-		public DateTime GetDateTime(int ordinal) => (DateTime) GetValue(ordinal);
+		public DateTime GetDateTime(int ordinal)
+		{
+			var value = GetValue(ordinal);
+			if (value is MySqlDateTime mySqlDateTime)
+				return mySqlDateTime.GetDateTime();
+			return (DateTime) value;
+		}
 
 		public DateTimeOffset GetDateTimeOffset(int ordinal) => new DateTimeOffset(DateTime.SpecifyKind(GetDateTime(ordinal), DateTimeKind.Utc));
+
+		public Stream GetStream(int ordinal)
+		{
+			CheckBinaryColumn(ordinal);
+			return (MemoryMarshal.TryGetArray(m_data, out var arraySegment)) ?
+				new MemoryStream(arraySegment.Array!, arraySegment.Offset + m_dataOffsets[ordinal], m_dataLengths[ordinal], writable: false) :
+				throw new InvalidOperationException("Can't get underlying array.");
+		}
 
 		public string GetString(int ordinal) => (string) GetValue(ordinal);
 
@@ -298,10 +348,24 @@ namespace MySqlConnector.Core
 		public double GetDouble(int ordinal)
 		{
 			var value = GetValue(ordinal);
-			return value is float floatValue ? floatValue : (double) value;
+			return value is float floatValue ? floatValue :
+				value is decimal decimalValue ? (double) decimalValue :
+				(double) value;
 		}
 
-		public float GetFloat(int ordinal) => (float) GetValue(ordinal);
+		public float GetFloat(int ordinal)
+		{
+			var value = GetValue(ordinal);
+
+			// Loss of precision is expected, significant loss of information is not.
+			// Use explicit range checks to guard against that.
+			return value switch
+			{
+				double doubleValue => (doubleValue >= float.MinValue && doubleValue <= float.MaxValue ? (float) doubleValue : throw new InvalidCastException("The value cannot be safely cast to Single.")),
+				decimal decimalValue => (float) decimalValue,
+				_ => (float) value
+			};
+		}
 
 		public MySqlDateTime GetMySqlDateTime(int ordinal)
 		{
@@ -311,9 +375,17 @@ namespace MySqlConnector.Core
 			return (MySqlDateTime) value;
 		}
 
+		public MySqlGeometry GetMySqlGeometry(int ordinal)
+		{
+			var value = GetValue(ordinal);
+			if (value is byte[] bytes && ResultSet.ColumnDefinitions![ordinal].ColumnType == ColumnType.Geometry)
+				return new MySqlGeometry(bytes);
+			throw new InvalidCastException("Can't convert {0} to MySqlGeometry.".FormatInvariant(ResultSet.ColumnDefinitions![ordinal].ColumnType));
+		}
+
 		public int GetValues(object[] values)
 		{
-			int count = Math.Min(values.Length, ResultSet.ColumnDefinitions.Length);
+			int count = Math.Min((values ?? throw new ArgumentNullException(nameof(values))).Length, ResultSet.ColumnDefinitions!.Length);
 			for (int i = 0; i < count; i++)
 				values[i] = GetValue(i);
 			return count;
@@ -325,7 +397,12 @@ namespace MySqlConnector.Core
 
 		public object this[string name] => GetValue(ResultSet.GetOrdinal(name));
 
-		protected Row(ResultSet resultSet) => ResultSet = resultSet;
+		protected Row(ResultSet resultSet)
+		{
+			ResultSet = resultSet;
+			m_dataOffsets = new int[ResultSet.ColumnDefinitions!.Length];
+			m_dataLengths = new int[ResultSet.ColumnDefinitions.Length];
+		}
 
 		protected abstract Row CloneCore();
 
@@ -336,30 +413,60 @@ namespace MySqlConnector.Core
 		protected ResultSet ResultSet { get; }
 		protected MySqlConnection Connection => ResultSet.Connection;
 
-		protected static Guid CreateGuidFromBytes(MySqlGuidFormat guidFormat, ReadOnlySpan<byte> bytes)
-		{
-#if NET45 || NET461 || NETSTANDARD1_3 || NETSTANDARD2_0
-			if (guidFormat == MySqlGuidFormat.Binary16)
-				return new Guid(new[] { bytes[3], bytes[2], bytes[1], bytes[0], bytes[5], bytes[4], bytes[7], bytes[6], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15] });
-			if (guidFormat == MySqlGuidFormat.TimeSwapBinary16)
-				return new Guid(new[] { bytes[7], bytes[6], bytes[5], bytes[4], bytes[3], bytes[2], bytes[1], bytes[0], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15] });
-			return new Guid(bytes.ToArray());
-#else
-			unsafe
+		protected unsafe static Guid CreateGuidFromBytes(MySqlGuidFormat guidFormat, ReadOnlySpan<byte> bytes) =>
+			guidFormat switch
 			{
-				if (guidFormat == MySqlGuidFormat.Binary16)
-				{
-					ReadOnlySpan<byte> guid = stackalloc byte[16] { bytes[3], bytes[2], bytes[1], bytes[0], bytes[5], bytes[4], bytes[7], bytes[6], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15] };
-					return new Guid(guid);
-				}
-				if (guidFormat == MySqlGuidFormat.TimeSwapBinary16)
-				{
-					ReadOnlySpan<byte> guid = stackalloc byte[16] { bytes[7], bytes[6], bytes[5], bytes[4], bytes[3], bytes[2], bytes[1], bytes[0], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15] };
-					return new Guid(guid);
-				}
-				return new Guid(bytes);
-			}
+#if NET45 || NET461 || NET471 || NETSTANDARD1_3 || NETSTANDARD2_0
+				MySqlGuidFormat.Binary16 => new Guid(new[] { bytes[3], bytes[2], bytes[1], bytes[0], bytes[5], bytes[4], bytes[7], bytes[6], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15] }),
+				MySqlGuidFormat.TimeSwapBinary16 => new Guid(new[] { bytes[7], bytes[6], bytes[5], bytes[4], bytes[3], bytes[2], bytes[1], bytes[0], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15] }),
+				_ => new Guid(bytes.ToArray()),
+#else
+				MySqlGuidFormat.Binary16 => new Guid(stackalloc byte[16] { bytes[3], bytes[2], bytes[1], bytes[0], bytes[5], bytes[4], bytes[7], bytes[6], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15] }),
+				MySqlGuidFormat.TimeSwapBinary16 => new Guid(stackalloc byte[16] { bytes[7], bytes[6], bytes[5], bytes[4], bytes[3], bytes[2], bytes[1], bytes[0], bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15] }),
+				_ => new Guid(bytes),
 #endif
+			};
+
+		protected static object ReadBit(ReadOnlySpan<byte> data, ColumnDefinitionPayload columnDefinition)
+		{
+			if ((columnDefinition.ColumnFlags & ColumnFlags.Binary) == 0)
+			{
+				// when the Binary flag IS NOT set, the BIT column is transmitted as MSB byte array
+				ulong bitValue = 0;
+				for (int i = 0; i < data.Length; i++)
+					bitValue = bitValue * 256 + data[i];
+				return bitValue;
+			}
+			else if (columnDefinition.ColumnLength <= 5 && data.Length == 1 && data[0] < (byte) (1 << (int) columnDefinition.ColumnLength))
+			{
+				// a server bug may return the data as binary even when we expect text: https://github.com/mysql-net/MySqlConnector/issues/713
+				// in this case, the data can't possibly be an ASCII digit, so assume it's the binary serialisation of BIT(n) where n <= 5
+				return (ulong) data[0];
+			}
+			else
+			{
+				// when the Binary flag IS set, the BIT column is transmitted as text
+				return ParseUInt64(data);
+			}
+		}
+
+		protected static ulong ParseUInt64(ReadOnlySpan<byte> data) =>
+			!Utf8Parser.TryParse(data, out ulong value, out var bytesConsumed) || bytesConsumed != data.Length ? throw new FormatException() : value;
+
+		private void CheckBinaryColumn(int ordinal)
+		{
+			if (m_dataOffsets[ordinal] == -1)
+				throw new InvalidCastException("Column is NULL.");
+
+			var column = ResultSet.ColumnDefinitions![ordinal];
+			var columnType = column.ColumnType;
+			if ((column.ColumnFlags & ColumnFlags.Binary) == 0 ||
+				(columnType != ColumnType.String && columnType != ColumnType.VarString && columnType != ColumnType.TinyBlob &&
+				columnType != ColumnType.Blob && columnType != ColumnType.MediumBlob && columnType != ColumnType.LongBlob &&
+				columnType != ColumnType.Geometry))
+			{
+				throw new InvalidCastException("Can't convert {0} to bytes.".FormatInvariant(columnType));
+			}
 		}
 
 		private static void CheckBufferArguments<T>(long dataOffset, T[] buffer, int bufferOffset, int length)
@@ -378,7 +485,7 @@ namespace MySqlConnector.Core
 				throw new ArgumentException("bufferOffset + length cannot exceed buffer.Length", nameof(length));
 		}
 
-		ArraySegment<byte> m_data;
+		ReadOnlyMemory<byte> m_data;
 		int[] m_dataOffsets;
 		int[] m_dataLengths;
 	}

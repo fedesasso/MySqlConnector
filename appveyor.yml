@@ -1,6 +1,16 @@
 image: Visual Studio 2017
 services:
 - mysql
+environment:
+  global:
+    DOTNET_SKIP_FIRST_TIME_EXPERIENCE: true
+    DOTNET_CLI_TELEMETRY_OPTOUT: 1
+cache:
+  - '%USERPROFILE%\.nuget\packages -> **\*.csproj'
+install:
+  # The following can be used to install a custom version of .NET Core
+  - ps: Invoke-WebRequest -Uri "https://raw.githubusercontent.com/dotnet/cli/master/scripts/obtain/dotnet-install.ps1" -OutFile "install-dotnet.ps1"
+  - ps: .\install-dotnet.ps1 -Version 3.0.100 -InstallDir "dotnetcli"
 build_script:
 - dotnet --info
 before_test:
@@ -11,11 +21,12 @@ test_script:
 - ps: .\.ci\test.ps1
 after_test:
 - cmd: |-
-    dotnet pack src\MySqlConnector\MySqlConnector.csproj -c Release -p:SourceLinkCreate=true -p:SourceLinkTest=true
-    dotnet pack src\MySqlConnector.Logging.log4net\MySqlConnector.Logging.log4net.csproj -c Release -p:SourceLinkCreate=true -p:SourceLinkTest=true
-    dotnet pack src\MySqlConnector.Logging.Microsoft.Extensions.Logging\MySqlConnector.Logging.Microsoft.Extensions.Logging.csproj -c Release -p:SourceLinkCreate=true -p:SourceLinkTest=true
-    dotnet pack src\MySqlConnector.Logging.NLog\MySqlConnector.Logging.NLog.csproj -c Release -p:SourceLinkCreate=true -p:SourceLinkTest=true
-    dotnet pack src\MySqlConnector.Logging.Serilog\MySqlConnector.Logging.Serilog.csproj -c Release -p:SourceLinkCreate=true -p:SourceLinkTest=true
+    dotnet pack src\MySqlConnector\MySqlConnector.csproj -c Release
+    dotnet pack src\MySqlConnector.Authentication.Ed25519\MySqlConnector.Authentication.Ed25519.csproj -c Release
+    dotnet pack src\MySqlConnector.Logging.log4net\MySqlConnector.Logging.log4net.csproj -c Release
+    dotnet pack src\MySqlConnector.Logging.Microsoft.Extensions.Logging\MySqlConnector.Logging.Microsoft.Extensions.Logging.csproj -c Release
+    dotnet pack src\MySqlConnector.Logging.NLog\MySqlConnector.Logging.NLog.csproj -c Release
+    dotnet pack src\MySqlConnector.Logging.Serilog\MySqlConnector.Logging.Serilog.csproj -c Release
 notifications:
 - provider: Slack
   incoming_webhook:
@@ -25,8 +36,8 @@ artifacts:
 deploy:
 - provider: NuGet
   api_key:
-    secure: cb7z9qQsz1qaBcS46hh/jF9gwMxRaHxyTHZfKl1R9UZS0ADX6RCcBr5LbyqiyqES
-  artifact: /.*MySqlConnector[0-9.]+nupkg/
+    secure: "jXzwnknTcQgGqjAxBzMLstPMaXy9rl3HowFns/QKaUqbUMUqXKpNLiNZKqv6tfnS"
+  artifact: /.*MySqlConnector[0-9.]+(-(alpha|beta|rc)\.?[0-9.]+)?nupkg/
   skip_symbols: true
   on:
     appveyor_repo_tag: true

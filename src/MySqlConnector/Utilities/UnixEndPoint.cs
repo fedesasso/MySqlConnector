@@ -43,7 +43,7 @@ namespace MySqlConnector.Utilities
 
 		public UnixEndPoint (string filename)
 		{
-			if (filename == null)
+			if (filename is null)
 				throw new ArgumentNullException ("filename");
 
 			if (filename == "")
@@ -121,13 +121,9 @@ namespace MySqlConnector.Utilities
 			return filename.GetHashCode ();
 		}
 
-		public override bool Equals (object o)
+		public override bool Equals (object? o)
 		{
-			UnixEndPoint other = o as UnixEndPoint;
-			if (other == null)
-				return false;
-
-			return (other.filename == filename);
+			return o is UnixEndPoint other && filename == other.filename;
 		}
 	}
 }

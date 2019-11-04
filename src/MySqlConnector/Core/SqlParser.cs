@@ -5,17 +5,23 @@ namespace MySqlConnector.Core
 {
 	internal abstract class SqlParser
 	{
+		protected StatementPreparer Preparer { get; }
+
+		protected SqlParser(StatementPreparer preparer) => Preparer = preparer;
+
 		public void Parse(string sql)
 		{
 			OnBeforeParse(sql ?? throw new ArgumentNullException(nameof(sql)));
 
 			int parameterStartIndex = -1;
+			var noBackslashEscapes = (Preparer.Options & StatementPreparerOptions.NoBackslashEscapes) == StatementPreparerOptions.NoBackslashEscapes;
 
 			var state = State.Beginning;
 			var beforeCommentState = State.Beginning;
-			for (int index = 0; index <= sql.Length; index++)
+			var isNamedParameter = false;
+			for (var index = 0; index < sql.Length; index++)
 			{
-				char ch = index == sql.Length ? ';' : sql[index];
+				var ch = sql[index];
 				if (state == State.EndOfLineComment)
 				{
 					if (ch == '\n')
@@ -34,7 +40,7 @@ namespace MySqlConnector.Core
 				{
 					if (ch == '\'')
 						state = State.SingleQuotedStringSingleQuote;
-					else if (ch == '\\')
+					else if (ch == '\\' && !noBackslashEscapes)
 						state = State.SingleQuotedStringBackslash;
 				}
 				else if (state == State.SingleQuotedStringBackslash)
@@ -45,7 +51,7 @@ namespace MySqlConnector.Core
 				{
 					if (ch == '"')
 						state = State.DoubleQuotedStringDoubleQuote;
-					else if (ch == '\\')
+					else if (ch == '\\' && !noBackslashEscapes)
 						state = State.DoubleQuotedStringBackslash;
 				}
 				else if (state == State.DoubleQuotedStringBackslash)
@@ -59,15 +65,66 @@ namespace MySqlConnector.Core
 				}
 				else if (state == State.SingleQuotedStringSingleQuote)
 				{
-					state = ch == '\'' ? State.SingleQuotedString : State.Statement;
+					if (ch == '\'')
+					{
+						state = State.SingleQuotedString;
+					}
+					else
+					{
+						if (isNamedParameter)
+							OnNamedParameter(parameterStartIndex, index - parameterStartIndex);
+						if (ch == ';')
+						{
+							OnStatementEnd(index);
+							state = State.Beginning;
+						}
+						else
+						{
+							state = State.Statement;
+						}
+					}
 				}
 				else if (state == State.DoubleQuotedStringDoubleQuote)
 				{
-					state = ch == '"' ? State.DoubleQuotedString : State.Statement;
+					if (ch == '"')
+					{
+						state = State.DoubleQuotedString;
+					}
+					else
+					{
+						if (isNamedParameter)
+							OnNamedParameter(parameterStartIndex, index - parameterStartIndex);
+						if (ch == ';')
+						{
+							OnStatementEnd(index);
+							state = State.Beginning;
+						}
+						else
+						{
+							state = State.Statement;
+						}
+					}
 				}
 				else if (state == State.BacktickQuotedStringBacktick)
 				{
-					state = ch == '`' ? State.BacktickQuotedString : State.Statement;
+					if (ch == '`')
+					{
+						state = State.BacktickQuotedString;
+					}
+					else
+					{
+						if (isNamedParameter)
+							OnNamedParameter(parameterStartIndex, index - parameterStartIndex);
+						if (ch == ';')
+						{
+							OnStatementEnd(index);
+							state = State.Beginning;
+						}
+						else
+						{
+							state = State.Statement;
+						}
+					}
 				}
 				else if (state == State.SecondHyphen)
 				{
@@ -110,7 +167,29 @@ namespace MySqlConnector.Core
 				}
 				else if (state == State.AtSign)
 				{
-					state = IsVariableName(ch) ? State.NamedParameter : State.Statement;
+					if (IsVariableName(ch))
+					{
+						state = State.NamedParameter;
+					}
+					else if (ch == '`')
+					{
+						state = State.BacktickQuotedString;
+						isNamedParameter = true;
+					}
+					else if (ch == '"')
+					{
+						state = State.DoubleQuotedString;
+						isNamedParameter = true;
+					}
+					else if (ch == '\'')
+					{
+						state = State.SingleQuotedString;
+						isNamedParameter = true;
+					}
+					else
+					{
+						state = State.Statement;
+					}
 				}
 				else if (state == State.NamedParameter)
 				{
@@ -133,12 +212,12 @@ namespace MySqlConnector.Core
 					if (state != State.Beginning && state != State.Statement)
 						throw new InvalidOperationException("Unexpected state: {0}".FormatInvariant(state));
 
-					if (ch == '-')
+					if (ch == '-' && index < sql.Length - 2 && sql[index + 1] == '-' && sql[index + 2] == ' ')
 					{
 						beforeCommentState = state;
 						state = State.Hyphen;
 					}
-					else if (ch == '/')
+					else if (ch == '/' && index < sql.Length - 1 && sql[index + 1] == '*')
 						state = State.ForwardSlash;
 					else if (ch == '\'')
 						state = State.SingleQuotedString;
@@ -175,7 +254,39 @@ namespace MySqlConnector.Core
 				}
 			}
 
-			OnParsed();
+			var states = FinalParseStates.None;
+			if (state == State.NamedParameter)
+			{
+				OnNamedParameter(parameterStartIndex, sql.Length - parameterStartIndex);
+				state = State.Statement;
+			}
+			else if (state == State.QuestionMark)
+			{
+				OnPositionalParameter(parameterStartIndex);
+				state = State.Statement;
+			}
+			else if (state == State.EndOfLineComment)
+			{
+				states |= FinalParseStates.NeedsNewline;
+				state = beforeCommentState;
+			}
+			else if (state == State.SingleQuotedStringSingleQuote || state == State.DoubleQuotedStringDoubleQuote || state == State.BacktickQuotedStringBacktick)
+			{
+				state = State.Statement;
+			}
+
+			if (state == State.Statement)
+			{
+				OnStatementEnd(sql.Length);
+				states |= FinalParseStates.NeedsSemicolon;
+				state = State.Beginning;
+			}
+			if (state == State.Beginning)
+			{
+				states |= FinalParseStates.Complete;
+			}
+
+			OnParsed(states);
 		}
 
 		protected virtual void OnBeforeParse(string sql)
@@ -198,13 +309,34 @@ namespace MySqlConnector.Core
 		{
 		}
 
-		protected virtual void OnParsed()
+		protected virtual void OnParsed(FinalParseStates states)
 		{
+		}
+
+		[Flags]
+		protected enum FinalParseStates
+		{
+			None = 0,
+
+			/// <summary>
+			/// The statement is complete (apart from potentially needing a semicolon or newline).
+			/// </summary>
+			Complete = 1,
+
+			/// <summary>
+			/// The statement needs a newline (e.g., to terminate a final comment).
+			/// </summary>
+			NeedsNewline = 2,
+
+			/// <summary>
+			/// The statement needs a semicolon (if another statement is going to be concatenated to it).
+			/// </summary>
+			NeedsSemicolon = 4,
 		}
 
 		private static bool IsWhitespace(char ch) => ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n';
 
-		private static bool IsVariableName(char ch) => (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '$';
+		private static bool IsVariableName(char ch) => (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '$' || (ch >= 0x0080 && ch <= 0xFFFF); // lgtm[cs/constant-comparison]
 
 		private enum State
 		{

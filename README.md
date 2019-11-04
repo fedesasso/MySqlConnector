@@ -5,7 +5,7 @@ provider for [MySQL](https://www.mysql.com/). It provides implementations of
 `DbConnection`, `DbCommand`, `DbDataReader`, `DbTransaction`—the classes
 needed to query and update databases from managed code.
 
-Complete documentation is available at the [MySqlConnector Documentation Website](https://mysql-net.github.io/MySqlConnector/).
+Complete documentation is available at the [MySqlConnector Documentation Website](https://mysqlconnector.net/).
 
 ## Why Use This Library?
 
@@ -25,7 +25,7 @@ This library outperforms Connector/NET (`MySql.Data`) on benchmarks:
 
 ### Bug Fixes
 
-This library [fixes dozens of outstanding bugs](https://mysql-net.github.io/MySqlConnector/tutorials/migrating-from-connector-net/#bugs-present-in-connector-net-that-are-fixed-in-mysqlconnector) in Connector/NET.
+This library [fixes dozens of outstanding bugs](https://mysqlconnector.net/tutorials/migrating-from-connector-net/#bugs-present-in-connector-net-that-are-fixed-in-mysqlconnector) in Connector/NET.
 
 ### License
 
@@ -38,6 +38,7 @@ from Oracle.
 This library is compatible with popular .NET ORMs including:
 
 * [Dapper](https://stackexchange.github.io/Dapper/) ([GitHub](https://github.com/StackExchange/dapper-dot-net), [NuGet](https://www.nuget.org/packages/Dapper))
+* [Linq To DB](https://linq2db.github.io/) ([GitHub](https://github.com/linq2db/linq2db), [NuGet](https://www.nuget.org/profiles/LinqToDB))
 * [NReco.Data](https://www.nrecosite.com/dalc_net.aspx) ([GitHub](https://github.com/nreco/data), [NuGet](https://www.nuget.org/packages/NReco.Data))
 * [Paradigm ORM](http://www.paradigm.net.co/) ([GitHub](https://github.com/MiracleDevs/Paradigm.ORM), [NuGet](https://www.nuget.org/packages/Paradigm.ORM.Data.MySql/))
 * [ServiceStack.OrmLite](https://servicestack.net/ormlite) ([GitHub](https://github.com/ServiceStack/ServiceStack.OrmLite), [NuGet](https://www.nuget.org/packages/ServiceStack.OrmLite.MySqlConnector))

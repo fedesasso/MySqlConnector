@@ -1,3 +1,4 @@
+#if !NETSTANDARD2_1 && !NETCOREAPP3_0
 using System;
 using System.Net.Sockets;
 using System.Runtime.CompilerServices;
@@ -41,6 +42,7 @@ namespace MySqlConnector.Utilities
 
 		static readonly Action s_sentinel = () => { };
 
-		Action m_continuation;
+		Action? m_continuation;
 	}
 }
+#endif

@@ -50,11 +50,7 @@ namespace MySqlConnector.Core
 				return isUnsigned ? (object) ParseUInt64(data) : ParseInt64(data);
 
 			case ColumnType.Bit:
-				// BIT column is transmitted as MSB byte array
-				ulong bitValue = 0;
-				for (int i = 0; i < data.Length; i++)
-					bitValue = bitValue * 256 + data[i];
-				return bitValue;
+				return ReadBit(data, columnDefinition);
 
 			case ColumnType.String:
 				if (Connection.GuidFormat == MySqlGuidFormat.Char36 && columnDefinition.ColumnLength / ProtocolUtility.GetBytesPerCharacter(columnDefinition.CharacterSet) == 36)
@@ -129,12 +125,9 @@ namespace MySqlConnector.Core
 		private static long ParseInt64(ReadOnlySpan<byte> data) =>
 			!Utf8Parser.TryParse(data, out long value, out var bytesConsumed) || bytesConsumed != data.Length ? throw new FormatException() : value;
 
-		private static ulong ParseUInt64(ReadOnlySpan<byte> data) =>
-			!Utf8Parser.TryParse(data, out ulong value, out var bytesConsumed) || bytesConsumed != data.Length ? throw new FormatException() : value;
-
 		private object ParseDateTime(ReadOnlySpan<byte> value)
 		{
-			Exception exception = null;
+			Exception? exception = null;
 			if (!Utf8Parser.TryParse(value, out int year, out var bytesConsumed) || bytesConsumed != 4)
 				goto InvalidDateTime;
 			if (value.Length < 5 || value[4] != 45)
@@ -152,7 +145,7 @@ namespace MySqlConnector.Core
 					return DateTime.MinValue;
 				if (Connection.AllowZeroDateTime)
 					return new MySqlDateTime();
-				throw new InvalidCastException("Unable to convert MySQL date/time to System.DateTime.");
+				throw new InvalidCastException("Unable to convert MySQL date/time to System.DateTime, set AllowZeroDateTime=True or ConvertZeroDateTime=True in the connection string. See https://mysqlconnector.net/connection-options/");
 			}
 
 			int hour, minute, second, microseconds;

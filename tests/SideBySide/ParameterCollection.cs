@@ -1,4 +1,5 @@
 using System;
+using System.Data.Common;
 using MySql.Data.MySqlClient;
 using Xunit;
 
@@ -19,18 +20,23 @@ namespace SideBySide
 
 		[Theory]
 		[InlineData("Baz", 0)]
-		[InlineData("@Baz", -1)]
-		[InlineData("?Baz", -1)]
-		[InlineData("Test", -1)]
 		[InlineData("@Test", 1)]
-		[InlineData("?Test", -1)]
-		[InlineData("Foo", -1)]
-		[InlineData("@Foo", -1)]
 		[InlineData("?Foo", 2)]
 		[InlineData("Bar", -1)]
 		[InlineData("@Bar", -1)]
 		[InlineData("?Bar", -1)]
 		[InlineData("", -1)]
+#if !BASELINE
+		[InlineData("@Baz", 0)]
+		[InlineData("?Baz", 0)]
+		[InlineData("@'Baz'", 0)]
+		[InlineData("?Test", 1)]
+		[InlineData("Test", 1)]
+		[InlineData("@`Test`", 1)]
+		[InlineData("Foo", 2)]
+		[InlineData("@Foo", 2)]
+		[InlineData("@\"Foo\"", 2)]
+#endif
 		public void FindByName(string parameterName, int position)
 		{
 			m_parameterCollection.Add(new MySqlParameter { ParameterName = "Baz", Value = 0 });
@@ -40,15 +46,6 @@ namespace SideBySide
 			Assert.Equal(position, index);
 			Assert.Equal(position != -1, m_parameterCollection.Contains(parameterName));
 
-			string expectedParameterName = parameterName;
-#if BASELINE
-			// NOTE: Baseline will match "Baz" in the parameter collection with "@Baz", but only for the indexing operator
-			if (parameterName.EndsWith("Baz", StringComparison.Ordinal))
-			{
-				position = 0;
-				expectedParameterName = "Baz";
-			}
-#endif
 			if (position == -1)
 			{
 				Assert.Throws<ArgumentException>(() => m_parameterCollection[parameterName]);
@@ -57,7 +54,7 @@ namespace SideBySide
 			{
 				var parameter = m_parameterCollection[parameterName];
 				Assert.NotNull(parameter);
-				Assert.Equal(expectedParameterName, parameter.ParameterName);
+				Assert.Same(m_parameterCollection[position], parameter);
 			}
 		}
 
@@ -66,6 +63,11 @@ namespace SideBySide
 		[InlineData("@Test")]
 		[InlineData("@tEsT")]
 		[InlineData("@TEST")]
+#if !BASELINE
+		[InlineData("test")]
+		[InlineData("@`test`")]
+		[InlineData("@'test'")]
+#endif
 		public void FindByNameIgnoringCase(string parameterName)
 		{
 			m_parameterCollection.AddWithValue("@Test", 1);
@@ -85,10 +87,28 @@ namespace SideBySide
 			Assert.Equal(0, m_parameterCollection.Count);
 		}
 
+		[Theory]
+		[InlineData("@test")]
+		[InlineData("@TEST")]
+#if !BASELINE
+		[InlineData("test")] // https://bugs.mysql.com/bug.php?id=93370
+		[InlineData("@'test'")]
+		[InlineData("@`TEST`")]
+#endif
+		public void AddDuplicateParameter(string parameterName)
+		{
+			m_parameterCollection.AddWithValue("@test", 1);
+			Assert.Throws<MySqlException>(() => { m_parameterCollection.AddWithValue(parameterName, 2); });
+		}
+
 		[Fact]
 		public void IndexOfNull()
 		{
+#if !BASELINE
+			Assert.Equal(-1, m_parameterCollection.IndexOf(null));
+#else
 			Assert.Throws<ArgumentNullException>(() => m_parameterCollection.IndexOf(null));
+#endif
 		}
 
 		[Fact]
@@ -187,6 +207,54 @@ namespace SideBySide
 			Assert.Equal(MySqlDbType.Double, parameter.MySqlDbType);
 			Assert.Equal(10, parameter.Size);
 			Assert.Same(parameter, m_parameterCollection[0]);
+		}
+
+		[Fact]
+		public void CopyTo()
+		{
+			m_parameterCollection.Add(new MySqlParameter { ParameterName = "@Test1", Value = 0 });
+			m_parameterCollection.Add(new MySqlParameter { ParameterName = "@Test2", Value = 1 });
+			var array = new DbParameter[2];
+			m_parameterCollection.CopyTo(array, 0);
+			Assert.Same(array[0], m_parameterCollection[0]);
+			Assert.Same(array[1], m_parameterCollection[1]);
+		}
+
+		[Fact]
+		public void CopyToIndex()
+		{
+			m_parameterCollection.Add(new MySqlParameter { ParameterName = "@Test1", Value = 0 });
+			m_parameterCollection.Add(new MySqlParameter { ParameterName = "@Test2", Value = 1 });
+			var array = new DbParameter[4];
+			m_parameterCollection.CopyTo(array, 1);
+			Assert.Null(array[0]);
+			Assert.Same(array[1], m_parameterCollection[0]);
+			Assert.Same(array[2], m_parameterCollection[1]);
+			Assert.Null(array[3]);
+		}
+
+		[Fact]
+		public void CopyToNullArray()
+		{
+			m_parameterCollection.Add(new MySqlParameter { ParameterName = "@Test1", Value = 0 });
+			m_parameterCollection.Add(new MySqlParameter { ParameterName = "@Test2", Value = 1 });
+			Assert.Throws<ArgumentNullException>(() => m_parameterCollection.CopyTo(null, 0));
+		}
+
+		[Fact]
+		public void CopyToSmallArray()
+		{
+			m_parameterCollection.Add(new MySqlParameter { ParameterName = "@Test1", Value = 0 });
+			m_parameterCollection.Add(new MySqlParameter { ParameterName = "@Test2", Value = 1 });
+			Assert.Throws<ArgumentException>(() => m_parameterCollection.CopyTo(new DbParameter[1], 0));
+		}
+
+		[Fact]
+		public void CopyToIndexOutOfRange()
+		{
+			m_parameterCollection.Add(new MySqlParameter { ParameterName = "@Test1", Value = 0 });
+			m_parameterCollection.Add(new MySqlParameter { ParameterName = "@Test2", Value = 1 });
+			Assert.Throws<ArgumentException>(() => m_parameterCollection.CopyTo(new DbParameter[2], 3));
 		}
 
 		MySqlCommand m_command;

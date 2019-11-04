@@ -4,6 +4,7 @@ using System.Globalization;
 using System.Text;
 using MySql.Data.MySqlClient;
 using MySqlConnector.Core;
+using MySqlConnector.Protocol.Serialization;
 using Xunit;
 
 namespace MySqlConnector.Tests
@@ -20,7 +21,28 @@ namespace MySqlConnector.Tests
 			var parameters = new MySqlParameterCollection();
 			parameters.AddWithValue("@param", 123);
 			var parsedSql = GetParsedSql(sql, parameters);
-			Assert.Equal(sql.Replace("@param", "123"), parsedSql);
+			Assert.Equal(sql.Replace("@param", "123") + ";", parsedSql);
+		}
+
+		[Theory]
+		[InlineData("UPDATE table SET a=a-@b;")]
+		[InlineData("UPDATE table SET a=a-/* subtract b */@b;")]
+		[InlineData("UPDATE table SET a=a+@b;")]
+		[InlineData("UPDATE table SET a=a/@b;")]
+		[InlineData("UPDATE table SET a=a-- \n-@b;")]
+		[InlineData("UPDATE table SET a = a-@b;")]
+		[InlineData("UPDATE table SET a = a+@b;")]
+		[InlineData("UPDATE table SET a = a - @b;")]
+		[InlineData("UPDATE table SET a=@b-a;")]
+		[InlineData("UPDATE table SET a=@b+a;")]
+		[InlineData("UPDATE table SET a = @b-a;")]
+		[InlineData("UPDATE table SET a = @b - a;")]
+		public void Bug563(string sql)
+		{
+			var parameters = new MySqlParameterCollection();
+			parameters.AddWithValue("@b", 123);
+			var parsedSql = GetParsedSql(sql, parameters);
+			Assert.Equal(sql.Replace("@b", "123"), parsedSql);
 		}
 
 		[Theory]
@@ -38,11 +60,11 @@ namespace MySqlConnector.Tests
 		[InlineData(null, DummyEnum.FirstValue, "0")]
 		public void EnumParametersAreParsedCorrectly(MySqlDbType? type, object value, string replacedValue)
 		{
-			const string sql = "SELECT @param";
+			const string sql = "SELECT @param;";
 			var parameters = new MySqlParameterCollection();
 			var parameter = new MySqlParameter("@param", value);
 
-			if (type != null)
+			if (type is object)
 			{
 				parameter.MySqlDbType = type.Value;
 			}
@@ -68,12 +90,56 @@ namespace MySqlConnector.Tests
 		}
 
 		[Theory]
+		[InlineData("SELECT @var;", "var")]
+		[InlineData("SELECT @var;", "@var")]
+		[InlineData("SELECT @var;", "@`var`")]
+		[InlineData("SELECT @var;", "@'var'")]
+		[InlineData("SELECT @`var`;", "var")]
+		[InlineData("SELECT @`var`;", "@var")]
+		[InlineData("SELECT @`var`;", "@`var`")]
+		[InlineData("SELECT @`v``ar`;", "v`ar")]
+		[InlineData("SELECT @`v``ar`;", "@`v``ar`")]
+		[InlineData("SELECT @'var';", "var")]
+		[InlineData("SELECT @'var';", "@var")]
+		[InlineData("SELECT @'var';", "@'var'")]
+		[InlineData("SELECT @'v''ar';", "v'ar")]
+		[InlineData("SELECT @'v''ar';", "@'v''ar'")]
+		[InlineData("SELECT @\"var\";", "var")]
+		[InlineData("SELECT @\"var\";", "@var")]
+		[InlineData("SELECT @\"var\";", "@\"var\"")]
+		[InlineData("SELECT @\"v\"\"ar\";", "v\"ar")]
+		[InlineData("SELECT @\"v\"\"ar\";", "@\"v\"\"ar\"")]
+		public void QuotedParameters(string sql, string parameterName)
+		{
+			var parameters = new MySqlParameterCollection();
+			parameters.AddWithValue(parameterName, 123);
+			var parsedSql = GetParsedSql(sql, parameters);
+			Assert.Equal("SELECT 123;", parsedSql);
+		}
+
+		[Theory]
+		[InlineData(@"SET @'var':=1;
+SELECT @foo+@'var' as R")]
+		[InlineData(@"SET @'var':=1;
+SELECT @foo+1 as R")]
+		[InlineData(@"SET @'var':=@foo+1;
+SELECT @'var' as R")]
+		public void Bug589(string sql)
+		{
+			var parameters = new MySqlParameterCollection();
+			parameters.AddWithValue("@foo", 22);
+			var parsedSql = GetParsedSql(sql, parameters, StatementPreparerOptions.AllowUserVariables);
+			Assert.Equal(sql.Replace("@foo", "22") + ";", parsedSql);
+		}
+
+		[Theory]
 		[MemberData(nameof(FormatParameterData))]
-		public void FormatParameter(object parameterValue, string replacedValue)
+		public void FormatParameter(object parameterValue, string replacedValue, bool noBackslashEscapes = false)
 		{
 			var parameters = new MySqlParameterCollection { new MySqlParameter("@param", parameterValue) };
-			const string sql = "SELECT @param";
-			var parsedSql = GetParsedSql(sql, parameters);
+			const string sql = "SELECT @param;";
+			var options = noBackslashEscapes ? StatementPreparerOptions.NoBackslashEscapes : StatementPreparerOptions.None;
+			var parsedSql = GetParsedSql(sql, parameters, options);
 			Assert.Equal(sql.Replace("@param", replacedValue), parsedSql);
 		}
 
@@ -92,10 +158,15 @@ namespace MySqlConnector.Tests
 				new object[] { 1.0123456789012346, "1.0123456789012346" },
 				new object[] { 123456789.123456789m, "123456789.123456789" },
 				new object[] { "1234", "'1234'" },
-				new object[] { "it's", "'it\\'s'" },
+				new object[] { "it's", "'it''s'" },
+				new object[] { "it's", "'it''s'", true },
 				new object[] { 'a', "'a'" },
-				new object[] { '\'', "'\\''" },
+				new object[] { '\'', "''''" },
+				new object[] { '\'', "''''", true },
 				new object[] { '\\', "'\\\\'" },
+				new object[] { '\\', "'\\'", true },
+				new object[] { "\\'", "'\\\\'''" },
+				new object[] { "\\'", "'\\'''", true },
 				new object[] { 'ﬃ', "'ﬃ'" },
 				new object[] { new DateTime(1234, 12, 23, 12, 34, 56, 789), "timestamp('1234-12-23 12:34:56.789000')" },
 				new object[] { new DateTimeOffset(1234, 12, 23, 12, 34, 56, 789, TimeSpan.FromHours(2)), "timestamp('1234-12-23 10:34:56.789000')" },
@@ -113,9 +184,37 @@ namespace MySqlConnector.Tests
 		public void GuidFormat(object options, string replacedValue)
 		{
 			var parameters = new MySqlParameterCollection { new MySqlParameter("@param", new Guid("61626364-6566-6768-696a-6b6c6d6e6f70")) };
-			const string sql = "SELECT @param";
+			const string sql = "SELECT @param;";
 			var parsedSql = GetParsedSql(sql, parameters, (StatementPreparerOptions) options);
 			Assert.Equal(sql.Replace("@param", replacedValue), parsedSql);
+		}
+
+		[Theory]
+		[InlineData("SELECT 1;", "SELECT 1;", true)]
+		[InlineData("SELECT 1", "SELECT 1;", true)]
+		[InlineData("SELECT 1 -- comment", "SELECT 1 -- comment\n;", true)]
+		[InlineData("SELECT 1 # comment", "SELECT 1 # comment\n;", true)]
+		[InlineData("SELECT '1", "SELECT '1", false)]
+		[InlineData("SELECT '1' /* test", "SELECT '1' /* test", false)]
+		[InlineData("SELECT '1';", "SELECT '1';", true)]
+		[InlineData("SELECT '1'", "SELECT '1';", true)]
+		[InlineData("SELECT \"1\";", "SELECT \"1\";", true)]
+		[InlineData("SELECT \"1\"", "SELECT \"1\";", true)]
+		[InlineData("SELECT * FROM `SELECT`;", "SELECT * FROM `SELECT`;", true)]
+		[InlineData("SELECT * FROM `SELECT`", "SELECT * FROM `SELECT`;", true)]
+		[InlineData("SELECT * FROM test WHERE id = ?;", "SELECT * FROM test WHERE id = 0;", true)]
+		[InlineData("SELECT * FROM test WHERE id = ?", "SELECT * FROM test WHERE id = 0;", true)]
+		public void CompleteStatements(string sql, string expectedSql, bool expectedComplete)
+		{
+			var parameters = new MySqlParameterCollection { new MySqlParameter { Value = 0 } };
+			var preparer = new StatementPreparer(sql, parameters, new StatementPreparerOptions());
+			var writer = new ByteBufferWriter();
+			var isComplete = preparer.ParseAndBindParameters(writer);
+			Assert.Equal(expectedComplete, isComplete);
+			string parsedSql;
+			using (var payload = writer.ToPayloadData())
+				parsedSql = Encoding.UTF8.GetString(payload.Span);
+			Assert.Equal(expectedSql, parsedSql);
 		}
 
 		[Theory]
@@ -146,38 +245,42 @@ namespace MySqlConnector.Tests
 			};
 
 			var preparer = new StatementPreparer(sql, parameters, StatementPreparerOptions.None);
-			using (var parsedStatements = preparer.SplitStatements())
+			using var parsedStatements = preparer.SplitStatements();
+			var splitStatements = parsedStatements.Statements;
+			Assert.Equal(expectedStatements.Length, splitStatements.Count);
+			for (var i = 0; i < splitStatements.Count; i++)
 			{
-				var splitStatements = parsedStatements.Statements;
-				Assert.Equal(expectedStatements.Length, splitStatements.Count);
-				for (var i = 0; i < splitStatements.Count; i++)
+				var parsedSql = Encoding.UTF8.GetString(splitStatements[i].StatementBytes.Slice(1));
+				Assert.Equal(expectedStatements[i], parsedSql);
+
+				var expectedParameterNamesOrIndexes = expectedStatementParameters[i].Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
+				var expectedParameterIndexes = new int[expectedParameterNamesOrIndexes.Length];
+				var expectedParameterNames = new string[expectedParameterNamesOrIndexes.Length];
+				for (var j = 0; j < expectedParameterNamesOrIndexes.Length; j++)
 				{
-					var parsedSql = Encoding.UTF8.GetString(splitStatements[i].StatementBytes.Slice(1));
-					Assert.Equal(expectedStatements[i], parsedSql);
-
-					var expectedParameterNamesOrIndexes = expectedStatementParameters[i].Split(new[] { ',' }, StringSplitOptions.RemoveEmptyEntries);
-					var expectedParameterIndexes = new int[expectedParameterNamesOrIndexes.Length];
-					var expectedParameterNames = new string[expectedParameterNamesOrIndexes.Length];
-					for (var j = 0; j < expectedParameterNamesOrIndexes.Length; j++)
+					if (expectedParameterNamesOrIndexes[j][0] == '@')
 					{
-						if (expectedParameterNamesOrIndexes[j][0] == '@')
-						{
-							expectedParameterNames[j] = expectedParameterNamesOrIndexes[j];
-							expectedParameterIndexes[j] = -1;
-						}
-						else
-						{
-							expectedParameterIndexes[j] = int.Parse(expectedParameterNamesOrIndexes[j], CultureInfo.InvariantCulture);
-						}
+						expectedParameterNames[j] = expectedParameterNamesOrIndexes[j];
+						expectedParameterIndexes[j] = -1;
 					}
-
-					Assert.Equal(expectedParameterIndexes, splitStatements[i].ParameterIndexes);
-					Assert.Equal(expectedParameterNames, splitStatements[i].ParameterNames);
+					else
+					{
+						expectedParameterIndexes[j] = int.Parse(expectedParameterNamesOrIndexes[j], CultureInfo.InvariantCulture);
+					}
 				}
+
+				Assert.Equal(expectedParameterIndexes, splitStatements[i].ParameterIndexes);
+				Assert.Equal(expectedParameterNames, splitStatements[i].ParameterNames);
 			}
 		}
 
-		private static string GetParsedSql(string input, MySqlParameterCollection parameters = null, StatementPreparerOptions options = StatementPreparerOptions.None) =>
-			Encoding.UTF8.GetString(new StatementPreparer(input, parameters ?? new MySqlParameterCollection(), options).ParseAndBindParameters().Slice(1));
+		private static string GetParsedSql(string input, MySqlParameterCollection parameters = null, StatementPreparerOptions options = StatementPreparerOptions.None)
+		{
+			var preparer = new StatementPreparer(input, parameters ?? new MySqlParameterCollection(), options);
+			var writer = new ByteBufferWriter();
+			preparer.ParseAndBindParameters(writer);
+			using var payload = writer.ToPayloadData();
+			return Encoding.UTF8.GetString(payload.Span);
+		}
 	}
 }

@@ -15,6 +15,8 @@ namespace MySqlConnector.Core
 
 			if (csb.ConnectionProtocol == MySqlConnectionProtocol.UnixSocket || (!Utility.IsWindows() && (csb.Server.StartsWith("/", StringComparison.Ordinal) || csb.Server.StartsWith("./", StringComparison.Ordinal))))
 			{
+				if (csb.LoadBalance != MySqlLoadBalance.RoundRobin)
+					throw new NotSupportedException("LoadBalance not supported when ConnectionProtocol=UnixSocket");
 				if (!File.Exists(csb.Server))
 					throw new MySqlException("Cannot find Unix Socket at " + csb.Server);
 				ConnectionProtocol = MySqlConnectionProtocol.UnixSocket;
@@ -22,6 +24,8 @@ namespace MySqlConnector.Core
 			}
 			else if (csb.ConnectionProtocol == MySqlConnectionProtocol.NamedPipe)
 			{
+				if (csb.LoadBalance != MySqlLoadBalance.RoundRobin)
+					throw new NotSupportedException("LoadBalance not supported when ConnectionProtocol=NamedPipe");
 				ConnectionProtocol = MySqlConnectionProtocol.NamedPipe;
 				HostNames = (csb.Server == "." || string.Equals(csb.Server, "localhost", StringComparison.OrdinalIgnoreCase)) ? s_localhostPipeServer : new[] { csb.Server };
 				PipeName = csb.PipeName;
@@ -46,7 +50,9 @@ namespace MySqlConnector.Core
 			SslMode = csb.SslMode;
 			CertificateFile = csb.CertificateFile;
 			CertificatePassword = csb.CertificatePassword;
-			CACertificateFile = csb.CACertificateFile;
+			SslCertificateFile = csb.SslCert;
+			SslKeyFile = csb.SslKey;
+			CACertificateFile = csb.SslCa;
 			CertificateStoreLocation = csb.CertificateStoreLocation;
 			CertificateThumbprint = csb.CertificateThumbprint;
 
@@ -62,6 +68,7 @@ namespace MySqlConnector.Core
 			MaximumPoolSize = (int) csb.MaximumPoolSize;
 
 			// Other Options
+			AllowLoadLocalInfile = csb.AllowLoadLocalInfile;
 			AllowPublicKeyRetrieval = csb.AllowPublicKeyRetrieval;
 			AllowUserVariables = csb.AllowUserVariables;
 			AllowZeroDateTime = csb.AllowZeroDateTime;
@@ -77,11 +84,14 @@ namespace MySqlConnector.Core
 			InteractiveSession = csb.InteractiveSession;
 			GuidFormat = GetEffectiveGuidFormat(csb.GuidFormat, csb.OldGuids);
 			Keepalive = csb.Keepalive;
+			NoBackslashEscapes = csb.NoBackslashEscapes;
 			PersistSecurityInfo = csb.PersistSecurityInfo;
 			ServerRsaPublicKeyFile = csb.ServerRsaPublicKeyFile;
+			ServerSPN = csb.ServerSPN;
 			TreatTinyAsBoolean = csb.TreatTinyAsBoolean;
 			UseAffectedRows = csb.UseAffectedRows;
 			UseCompression = csb.UseCompression;
+			UseXaTransactions = csb.UseXaTransactions;
 		}
 
 		private static MySqlGuidFormat GetEffectiveGuidFormat(MySqlGuidFormat guidFormat, bool oldGuids)
@@ -113,22 +123,24 @@ namespace MySqlConnector.Core
 		// Base Options
 		public string ConnectionString { get; }
 		public MySqlConnectionProtocol ConnectionProtocol { get; }
-		public IReadOnlyList<string> HostNames { get; }
+		public IReadOnlyList<string>? HostNames { get; }
 		public MySqlLoadBalance LoadBalance { get; }
 		public int Port { get; }
-		public string PipeName { get; }
-		public string UnixSocket { get; }
+		public string? PipeName { get; }
+		public string? UnixSocket { get; }
 		public string UserID { get; }
 		public string Password { get; }
 		public string Database { get; }
 
 		// SSL/TLS Options
 		public MySqlSslMode SslMode { get; }
-		public string CertificateFile { get; }
-		public string CertificatePassword { get; }
-		public string CACertificateFile { get; }
+		public string? CertificateFile { get; }
+		public string? CertificatePassword { get; }
+		public string? CACertificateFile { get; }
+		public string? SslCertificateFile { get; }
+		public string? SslKeyFile { get; }
 		public MySqlCertificateStoreLocation CertificateStoreLocation { get; }
-		public string CertificateThumbprint { get; }
+		public string? CertificateThumbprint { get; }
 
 		// Connection Pooling Options
 		public bool Pooling { get; }
@@ -140,10 +152,11 @@ namespace MySqlConnector.Core
 		public int MaximumPoolSize { get; }
 
 		// Other Options
+		public bool AllowLoadLocalInfile { get; }
 		public bool AllowPublicKeyRetrieval { get; }
 		public bool AllowUserVariables { get; }
 		public bool AllowZeroDateTime { get; }
-		public string ApplicationName { get; }
+		public string? ApplicationName { get; }
 		public bool AutoEnlist { get; }
 		public int ConnectionTimeout { get; }
 		public bool ConvertZeroDateTime { get; }
@@ -155,13 +168,16 @@ namespace MySqlConnector.Core
 		public bool IgnorePrepare { get; }
 		public bool InteractiveSession { get; }
 		public uint Keepalive { get; }
+		public bool NoBackslashEscapes { get; }
 		public bool PersistSecurityInfo { get; }
-		public string ServerRsaPublicKeyFile { get; }
+		public string? ServerRsaPublicKeyFile { get; }
+		public string? ServerSPN { get; }
 		public bool TreatTinyAsBoolean { get; }
 		public bool UseAffectedRows { get; }
 		public bool UseCompression { get; }
+		public bool UseXaTransactions { get; }
 
-		public byte[] ConnectionAttributes { get; set; }
+		public byte[]? ConnectionAttributes { get; set; }
 
 		// Helper Functions
 		int? m_connectionTimeoutMilliseconds;

@@ -1,33 +1,68 @@
 using System;
-using System.Globalization;
+using System.Buffers.Text;
+using System.Text;
+using MySqlConnector.Utilities;
 
 namespace MySqlConnector.Core
 {
 	internal sealed class ServerVersion
 	{
-		public ServerVersion(string versionString)
+		public ServerVersion(ReadOnlySpan<byte> versionString)
 		{
-			OriginalString = versionString;
+			OriginalString = Encoding.ASCII.GetString(versionString);
 
-			var last = 0;
-			var index = versionString.IndexOf('.', last);
-			var major = int.Parse(versionString.Substring(last, index - last), CultureInfo.InvariantCulture);
-			last = index + 1;
-
-			index = versionString.IndexOf('.', last);
-			var minor = int.Parse(versionString.Substring(last, index - last), CultureInfo.InvariantCulture);
-			last = index + 1;
-
-			do
-			{
-				index++;
-			} while (index < versionString.Length && versionString[index] >= '0' && versionString[index] <= '9');
-			var build = int.Parse(versionString.Substring(last, index - last), CultureInfo.InvariantCulture);
+			if (!Utf8Parser.TryParse(versionString, out int major, out var bytesConsumed) || versionString[bytesConsumed] != 0x2E)
+				throw new InvalidOperationException("Error parsing " + OriginalString);
+			versionString = versionString.Slice(bytesConsumed + 1);
+			if (!Utf8Parser.TryParse(versionString, out int minor, out bytesConsumed) || versionString[bytesConsumed] != 0x2E)
+				throw new InvalidOperationException("Error parsing " + OriginalString);
+			versionString = versionString.Slice(bytesConsumed + 1);
+			if (!Utf8Parser.TryParse(versionString, out int build, out bytesConsumed))
+				throw new InvalidOperationException("Error parsing " + OriginalString);
+			versionString = versionString.Slice(bytesConsumed);
 
 			Version = new Version(major, minor, build);
+
+			// check for MariaDB version appended to a fake MySQL version
+			if (versionString.Length != 0 && versionString[0] == 0x2D)
+			{
+				versionString = versionString.Slice(1);
+				var mariaDbIndex = versionString.IndexOf(MariaDb);
+				if (mariaDbIndex != -1)
+				{
+					var totalBytesRead = 0;
+					if (Utf8Parser.TryParse(versionString, out major, out bytesConsumed) && versionString[bytesConsumed] == 0x2E)
+					{
+						versionString = versionString.Slice(bytesConsumed + 1);
+						totalBytesRead += bytesConsumed + 1;
+						if (Utf8Parser.TryParse(versionString, out minor, out bytesConsumed) && versionString[bytesConsumed] == 0x2E)
+						{
+							versionString = versionString.Slice(bytesConsumed + 1);
+							totalBytesRead += bytesConsumed + 1;
+							if (Utf8Parser.TryParse(versionString, out build, out bytesConsumed) && versionString[bytesConsumed] == 0x2D)
+							{
+								totalBytesRead += bytesConsumed;
+								if (totalBytesRead == mariaDbIndex)
+									MariaDbVersion = new Version(major, minor, build);
+							}
+						}
+					}
+				}
+			}
 		}
 
 		public string OriginalString { get; }
 		public Version Version { get; }
+		public Version? MariaDbVersion { get; }
+
+		public static ServerVersion Empty { get; } = new ServerVersion();
+
+		private ServerVersion()
+		{
+			OriginalString = "";
+			Version = new Version(0, 0);
+		}
+
+		static ReadOnlySpan<byte> MariaDb => new byte[] { 0x2D, 0x4D, 0x61, 0x72, 0x69, 0x61, 0x44, 0x42 }; // -MariaDB
 	}
 }

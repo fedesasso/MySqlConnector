@@ -9,14 +9,14 @@ namespace MySqlConnector.Protocol.Payloads
 		public int WarningCount { get; }
 		public ServerStatus ServerStatus { get; }
 
-		public static EofPayload Create(PayloadData payload)
+		public static EofPayload Create(ReadOnlySpan<byte> span)
 		{
-			var reader = new ByteArrayReader(payload.ArraySegment);
+			var reader = new ByteArrayReader(span);
 			reader.ReadByte(Signature);
-			if (payload.ArraySegment.Count > 5)
+			if (span.Length > 5)
 				throw new FormatException("Not an EOF packet");
 			int warningCount = reader.ReadUInt16();
-			ServerStatus serverStatus = (ServerStatus) reader.ReadUInt16();
+			var serverStatus = (ServerStatus) reader.ReadUInt16();
 
 			if (reader.BytesRemaining != 0)
 				throw new FormatException("Extra bytes at end of payload.");
@@ -31,7 +31,7 @@ namespace MySqlConnector.Protocol.Payloads
 		/// <param name="payload">The payload to examine.</param>
 		/// <returns><c>true</c> if this is an EOF packet; otherwise, <c>false</c>.</returns>
 		public static bool IsEof(PayloadData payload) =>
-			payload.ArraySegment.Count > 0 && payload.ArraySegment.Count < 9 && payload.ArraySegment.Array[payload.ArraySegment.Offset] == Signature;
+			payload.Span.Length > 0 && payload.Span.Length < 9 && payload.HeaderByte == Signature;
 
 		public const byte Signature = 0xFE;
 

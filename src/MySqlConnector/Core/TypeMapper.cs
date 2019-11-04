@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using System.Data;
 using System.Linq;
+using System.Text;
 using MySql.Data.MySqlClient;
 using MySqlConnector.Protocol;
 using MySqlConnector.Protocol.Payloads;
@@ -25,7 +26,6 @@ namespace MySqlConnector.Core
 			// boolean
 			var typeBoolean = AddDbTypeMapping(new DbTypeMapping(typeof(bool), new[] { DbType.Boolean }, convert: o => Convert.ToBoolean(o)));
 			AddColumnTypeMetadata(new ColumnTypeMetadata("TINYINT", typeBoolean, MySqlDbType.Bool, isUnsigned: false, length: 1, columnSize: 1, simpleDataTypeName: "BOOL", createFormat: "BOOL"));
-			AddColumnTypeMetadata(new ColumnTypeMetadata("TINYINT", typeBoolean, MySqlDbType.Bool, isUnsigned: true, length: 1));
 
 			// integers
 			var typeSbyte = AddDbTypeMapping(new DbTypeMapping(typeof(sbyte), new[] { DbType.SByte }, convert: o => Convert.ToSByte(o)));
@@ -37,6 +37,7 @@ namespace MySqlConnector.Core
 			var typeLong = AddDbTypeMapping(new DbTypeMapping(typeof(long), new[] { DbType.Int64 }, convert: o => Convert.ToInt64(o)));
 			var typeUlong = AddDbTypeMapping(new DbTypeMapping(typeof(ulong), new[] { DbType.UInt64 }, convert: o => Convert.ToUInt64(o)));
 			AddColumnTypeMetadata(new ColumnTypeMetadata("TINYINT", typeSbyte, MySqlDbType.Byte, isUnsigned: false));
+			AddColumnTypeMetadata(new ColumnTypeMetadata("TINYINT", typeByte, MySqlDbType.UByte, isUnsigned: true, length: 1));
 			AddColumnTypeMetadata(new ColumnTypeMetadata("TINYINT", typeByte, MySqlDbType.UByte, isUnsigned: true));
 			AddColumnTypeMetadata(new ColumnTypeMetadata("SMALLINT", typeShort, MySqlDbType.Int16, isUnsigned: false));
 			AddColumnTypeMetadata(new ColumnTypeMetadata("SMALLINT", typeUshort, MySqlDbType.UInt16, isUnsigned: true));
@@ -58,8 +59,8 @@ namespace MySqlConnector.Core
 			AddColumnTypeMetadata(new ColumnTypeMetadata("FLOAT", typeFloat, MySqlDbType.Float));
 
 			// string
-			var typeFixedString = AddDbTypeMapping(new DbTypeMapping(typeof(string), new[] { DbType.StringFixedLength, DbType.AnsiStringFixedLength }, convert: Convert.ToString));
-			var typeString = AddDbTypeMapping(new DbTypeMapping(typeof(string), new[] { DbType.String, DbType.AnsiString, DbType.Xml }, convert: Convert.ToString));
+			var typeFixedString = AddDbTypeMapping(new DbTypeMapping(typeof(string), new[] { DbType.StringFixedLength, DbType.AnsiStringFixedLength }, convert: Convert.ToString!));
+			var typeString = AddDbTypeMapping(new DbTypeMapping(typeof(string), new[] { DbType.String, DbType.AnsiString, DbType.Xml }, convert: Convert.ToString!));
 			AddColumnTypeMetadata(new ColumnTypeMetadata("VARCHAR", typeString, MySqlDbType.VarChar, createFormat: "VARCHAR({0});size"));
 			AddColumnTypeMetadata(new ColumnTypeMetadata("VARCHAR", typeString, MySqlDbType.VarString));
 			AddColumnTypeMetadata(new ColumnTypeMetadata("CHAR", typeFixedString, MySqlDbType.String, createFormat: "CHAR({0});size"));
@@ -94,7 +95,7 @@ namespace MySqlConnector.Core
 			var typeDate = AddDbTypeMapping(new DbTypeMapping(typeof(DateTime), new[] { DbType.Date }));
 			var typeDateTime = AddDbTypeMapping(new DbTypeMapping(typeof(DateTime), new[] { DbType.DateTime, DbType.DateTime2, DbType.DateTimeOffset }));
 			AddDbTypeMapping(new DbTypeMapping(typeof(DateTimeOffset), new[] { DbType.DateTimeOffset }));
-			var typeTime = AddDbTypeMapping(new DbTypeMapping(typeof(TimeSpan), new[] { DbType.Time }));
+			var typeTime = AddDbTypeMapping(new DbTypeMapping(typeof(TimeSpan), new[] { DbType.Time }, convert: o => o is string s ? Utility.ParseTimeSpan(Encoding.UTF8.GetBytes(s)) : Convert.ChangeType(o, typeof(TimeSpan))));
 			AddColumnTypeMetadata(new ColumnTypeMetadata("DATETIME", typeDateTime, MySqlDbType.DateTime));
 			AddColumnTypeMetadata(new ColumnTypeMetadata("DATE", typeDate, MySqlDbType.Date));
 			AddColumnTypeMetadata(new ColumnTypeMetadata("DATE", typeDate, MySqlDbType.Newdate));
@@ -103,11 +104,11 @@ namespace MySqlConnector.Core
 			AddColumnTypeMetadata(new ColumnTypeMetadata("YEAR", typeInt, MySqlDbType.Year));
 
 			// guid
-			var typeGuid = AddDbTypeMapping(new DbTypeMapping(typeof(Guid), new[] { DbType.Guid }, convert: o => Guid.Parse(Convert.ToString(o))));
+				var typeGuid = AddDbTypeMapping(new DbTypeMapping(typeof(Guid), new[] { DbType.Guid }, convert: o => Guid.Parse(Convert.ToString(o)!)));
 			AddColumnTypeMetadata(new ColumnTypeMetadata("CHAR", typeGuid, MySqlDbType.Guid, length: 36, simpleDataTypeName: "CHAR(36)", createFormat: "CHAR(36)"));
 
 			// null
-			var typeNull = AddDbTypeMapping(new DbTypeMapping(typeof(object), new[] { DbType.Object }, convert: o => null));
+			var typeNull = AddDbTypeMapping(new DbTypeMapping(typeof(object), new[] { DbType.Object }));
 			AddColumnTypeMetadata(new ColumnTypeMetadata("NULL", typeNull, MySqlDbType.Null));
 		}
 
@@ -131,7 +132,7 @@ namespace MySqlConnector.Core
 		{
 			m_dbTypeMappingsByClrType[dbTypeMapping.ClrType] = dbTypeMapping;
 
-			if (dbTypeMapping.DbTypes != null)
+			if (dbTypeMapping.DbTypes is object)
 				foreach (var dbType in dbTypeMapping.DbTypes)
 					m_dbTypeMappingsByDbType[dbType] = dbTypeMapping;
 
@@ -148,26 +149,26 @@ namespace MySqlConnector.Core
 				m_mySqlDbTypeToColumnTypeMetadata.Add(columnTypeMetadata.MySqlDbType, columnTypeMetadata);
 		}
 
-		internal DbTypeMapping GetDbTypeMapping(Type clrType)
+		internal DbTypeMapping? GetDbTypeMapping(Type clrType)
 		{
 			m_dbTypeMappingsByClrType.TryGetValue(clrType, out var dbTypeMapping);
 			return dbTypeMapping;
 		}
 
-		internal DbTypeMapping GetDbTypeMapping(DbType dbType)
+		internal DbTypeMapping? GetDbTypeMapping(DbType dbType)
 		{
 			m_dbTypeMappingsByDbType.TryGetValue(dbType, out var dbTypeMapping);
 			return dbTypeMapping;
 		}
 
-		public DbTypeMapping GetDbTypeMapping(string columnTypeName, bool unsigned = false, int length = 0)
+		public DbTypeMapping? GetDbTypeMapping(string columnTypeName, bool unsigned = false, int length = 0)
 		{
 			return GetColumnTypeMetadata(columnTypeName, unsigned, length)?.DbTypeMapping;
 		}
 
-		public MySqlDbType GetMySqlDbType(string typeName, bool unsigned) => GetColumnTypeMetadata(typeName, unsigned, 0).MySqlDbType;
+		public MySqlDbType GetMySqlDbType(string typeName, bool unsigned, int length) => GetColumnTypeMetadata(typeName, unsigned, length)!.MySqlDbType;
 
-		private ColumnTypeMetadata GetColumnTypeMetadata(string columnTypeName, bool unsigned, int length)
+		private ColumnTypeMetadata? GetColumnTypeMetadata(string columnTypeName, bool unsigned, int length)
 		{
 			if (!m_columnTypeMetadataLookup.TryGetValue(ColumnTypeMetadata.CreateLookupKey(columnTypeName, unsigned, length), out var columnTypeMetadata) && length != 0)
 				m_columnTypeMetadataLookup.TryGetValue(ColumnTypeMetadata.CreateLookupKey(columnTypeName, unsigned, 0), out columnTypeMetadata);
@@ -417,6 +418,10 @@ namespace MySqlConnector.Core
 
 			case MySqlDbType.Geometry:
 				columnType = ColumnType.Geometry;
+				break;
+
+			case MySqlDbType.Null:
+				columnType = ColumnType.Null;
 				break;
 
 			default:

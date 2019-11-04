@@ -1,4 +1,5 @@
 using System.IO;
+using System.Runtime.InteropServices;
 using System.Security.Authentication;
 using System.Security.Cryptography.X509Certificates;
 using System.Threading.Tasks;
@@ -22,20 +23,16 @@ namespace SideBySide
 			csb.SslMode = MySqlSslMode.Preferred;
 			csb.CertificateFile = null;
 			csb.CertificatePassword = null;
-			using (var connection = new MySqlConnection(csb.ConnectionString))
-			{
-				using (var cmd = connection.CreateCommand())
-				{
-					await connection.OpenAsync();
-					Assert.True(connection.SslIsEncrypted);
-					Assert.True(connection.SslIsSigned);
-					Assert.True(connection.SslIsAuthenticated);
-					Assert.False(connection.SslIsMutuallyAuthenticated);
-					cmd.CommandText = "SHOW SESSION STATUS LIKE 'Ssl_version'";
-					var sslVersion = (string)await cmd.ExecuteScalarAsync();
-					Assert.False(string.IsNullOrWhiteSpace(sslVersion));
-				}
-			}
+			using var connection = new MySqlConnection(csb.ConnectionString);
+			using var cmd = connection.CreateCommand();
+			await connection.OpenAsync();
+			Assert.True(connection.SslIsEncrypted);
+			Assert.True(connection.SslIsSigned);
+			Assert.True(connection.SslIsAuthenticated);
+			Assert.False(connection.SslIsMutuallyAuthenticated);
+			cmd.CommandText = "SHOW SESSION STATUS LIKE 'Ssl_version'";
+			var sslVersion = (string) await cmd.ExecuteScalarAsync();
+			Assert.False(string.IsNullOrWhiteSpace(sslVersion));
 		}
 #endif
 
@@ -51,29 +48,49 @@ namespace SideBySide
 			var csb = AppConfig.CreateConnectionStringBuilder();
 			csb.CertificateFile = Path.Combine(AppConfig.CertsPath, certFile);
 			csb.CertificatePassword = certFilePassword;
-			if (caCertFile != null)
+			if (caCertFile is object)
 			{
 				csb.SslMode = MySqlSslMode.VerifyCA;
-#if !BASELINE
-				csb.CACertificateFile = Path.Combine(AppConfig.CertsPath, caCertFile);
-#endif
+				csb.SslCa = Path.Combine(AppConfig.CertsPath, caCertFile);
 			}
-			using (var connection = new MySqlConnection(csb.ConnectionString))
+			await DoTestSsl(csb.ConnectionString);
+		}
+
+#if !NETCOREAPP1_1_2 && !NETCOREAPP2_0
+		[SkippableTheory(ConfigSettings.RequiresSsl | ConfigSettings.KnownClientCertificate)]
+		[InlineData("ssl-client-cert.pem", "ssl-client-key.pem", null)]
+#if !BASELINE
+		[InlineData("ssl-client-cert.pem", "ssl-client-key.pem", "ssl-ca-cert.pem")] // https://bugs.mysql.com/bug.php?id=95436
+#endif
+		public async Task ConnectSslClientCertificatePem(string certFile, string keyFile, string caCertFile)
+		{
+			var csb = AppConfig.CreateConnectionStringBuilder();
+			csb.CertificateFile = null;
+			csb.SslCert = Path.Combine(AppConfig.CertsPath, certFile);
+			csb.SslKey = Path.Combine(AppConfig.CertsPath, keyFile);
+			if (caCertFile is object)
 			{
-				using (var cmd = connection.CreateCommand())
-				{
-					await connection.OpenAsync();
-#if !BASELINE
-					Assert.True(connection.SslIsEncrypted);
-					Assert.True(connection.SslIsSigned);
-					Assert.True(connection.SslIsAuthenticated);
-					Assert.True(connection.SslIsMutuallyAuthenticated);
-#endif
-					cmd.CommandText = "SHOW SESSION STATUS LIKE 'Ssl_version'";
-					var sslVersion = (string)await cmd.ExecuteScalarAsync();
-					Assert.False(string.IsNullOrWhiteSpace(sslVersion));
-				}
+				csb.SslMode = MySqlSslMode.VerifyCA;
+				csb.SslCa = Path.Combine(AppConfig.CertsPath, caCertFile);
 			}
+			await DoTestSsl(csb.ConnectionString);
+		}
+#endif
+
+		private async Task DoTestSsl(string connectionString)
+		{
+			using var connection = new MySqlConnection(connectionString);
+			using var cmd = connection.CreateCommand();
+			await connection.OpenAsync();
+#if !BASELINE
+			Assert.True(connection.SslIsEncrypted);
+			Assert.True(connection.SslIsSigned);
+			Assert.True(connection.SslIsAuthenticated);
+			Assert.True(connection.SslIsMutuallyAuthenticated);
+#endif
+			cmd.CommandText = "SHOW SESSION STATUS LIKE 'Ssl_version'";
+			var sslVersion = (string) await cmd.ExecuteScalarAsync();
+			Assert.False(string.IsNullOrWhiteSpace(sslVersion));
 		}
 
 		[SkippableTheory(ConfigSettings.RequiresSsl | ConfigSettings.KnownClientCertificate)]
@@ -87,25 +104,23 @@ namespace SideBySide
 			store.Add(certificate);
 
 			var csb = AppConfig.CreateConnectionStringBuilder();
-			
+
 			csb.CertificateStoreLocation = storeLocation;
 			csb.CertificateThumbprint = thumbprint;
 
 			using (var connection = new MySqlConnection(csb.ConnectionString))
 			{
-				using (var cmd = connection.CreateCommand())
-				{
-					await connection.OpenAsync();
+				using var cmd = connection.CreateCommand();
+				await connection.OpenAsync();
 #if !BASELINE
-					Assert.True(connection.SslIsEncrypted);
-					Assert.True(connection.SslIsSigned);
-					Assert.True(connection.SslIsAuthenticated);
-					Assert.True(connection.SslIsMutuallyAuthenticated);
+				Assert.True(connection.SslIsEncrypted);
+				Assert.True(connection.SslIsSigned);
+				Assert.True(connection.SslIsAuthenticated);
+				Assert.True(connection.SslIsMutuallyAuthenticated);
 #endif
-					cmd.CommandText = "SHOW SESSION STATUS LIKE 'Ssl_version'";
-					var sslVersion = (string) await cmd.ExecuteScalarAsync();
-					Assert.False(string.IsNullOrWhiteSpace(sslVersion));
-				}
+				cmd.CommandText = "SHOW SESSION STATUS LIKE 'Ssl_version'";
+				var sslVersion = (string) await cmd.ExecuteScalarAsync();
+				Assert.False(string.IsNullOrWhiteSpace(sslVersion));
 			}
 
 			// Remove the certificate from store
@@ -118,10 +133,8 @@ namespace SideBySide
 			var csb = AppConfig.CreateConnectionStringBuilder();
 			csb.CertificateFile = Path.Combine(AppConfig.CertsPath, "ssl-client-cert.pem");
 			csb.SslMode = MySqlSslMode.Required;
-			using (var connection = new MySqlConnection(csb.ConnectionString))
-			{
-				await Assert.ThrowsAsync<MySqlException>(async () => await connection.OpenAsync());
-			}
+			using var connection = new MySqlConnection(csb.ConnectionString);
+			await Assert.ThrowsAsync<MySqlException>(async () => await connection.OpenAsync());
 		}
 
 		[SkippableFact(ServerFeatures.KnownCertificateAuthority, ConfigSettings.RequiresSsl)]
@@ -130,58 +143,57 @@ namespace SideBySide
 			var csb = AppConfig.CreateConnectionStringBuilder();
 			csb.CertificateFile = Path.Combine(AppConfig.CertsPath, "non-ca-client.pfx");
 			csb.CertificatePassword = "";
-			using (var connection = new MySqlConnection(csb.ConnectionString))
-			{
-#if BASELINE
-				var exType = typeof(IOException);
-#else
-				var exType = typeof(MySqlException);
-#endif
-				await Assert.ThrowsAsync(exType, async () => await connection.OpenAsync());
-			}
+			using var connection = new MySqlConnection(csb.ConnectionString);
+			await Assert.ThrowsAsync<MySqlException>(async () => await connection.OpenAsync());
 		}
 
-		[SkippableFact(ServerFeatures.KnownCertificateAuthority, ConfigSettings.RequiresSsl, Baseline = "MySql.Data does not support CACertificateFile")]
+		[SkippableFact(ServerFeatures.KnownCertificateAuthority, ConfigSettings.RequiresSsl)]
 		public async Task ConnectSslBadCaCertificate()
 		{
 			var csb = AppConfig.CreateConnectionStringBuilder();
-			csb.CertificateFile = Path.Combine(AppConfig.CertsPath, "ssl-client.pfx");
-			csb.SslMode = MySqlSslMode.VerifyCA;
 #if !BASELINE
-			csb.CACertificateFile = Path.Combine(AppConfig.CertsPath, "non-ca-client-cert.pem");
+			csb.CertificateFile = Path.Combine(AppConfig.CertsPath, "ssl-client.pfx");
+#else
+			csb.SslCert = Path.Combine(AppConfig.CertsPath, "ssl-client-cert.pem");
+			csb.SslKey = Path.Combine(AppConfig.CertsPath, "ssl-client-key.pem");
 #endif
-			using (var connection = new MySqlConnection(csb.ConnectionString))
-			{
-				await Assert.ThrowsAsync<MySqlException>(async () => await connection.OpenAsync());
-			}
+			csb.SslMode = MySqlSslMode.VerifyCA;
+			csb.SslCa = Path.Combine(AppConfig.CertsPath, "non-ca-client-cert.pem");
+			using var connection = new MySqlConnection(csb.ConnectionString);
+			await Assert.ThrowsAsync<MySqlException>(async () => await connection.OpenAsync());
 		}
 
 		[SkippableFact(ConfigSettings.RequiresSsl)]
 		public async Task ConnectSslTlsVersion()
 		{
-			using (var connection = new MySqlConnection(AppConfig.ConnectionString))
-			{
-				await connection.OpenAsync();
+			using var connection = new MySqlConnection(AppConfig.ConnectionString);
+			await connection.OpenAsync();
 #if BASELINE
-				var expectedProtocol = AppConfig.SupportedFeatures.HasFlag(ServerFeatures.Tls11) ? SslProtocols.Tls11 : SslProtocols.Tls;
+			var expectedProtocol = AppConfig.SupportedFeatures.HasFlag(ServerFeatures.Tls11) ? SslProtocols.Tls11 : SslProtocols.Tls;
 #else
-				var expectedProtocol = AppConfig.SupportedFeatures.HasFlag(ServerFeatures.Tls12) ? SslProtocols.Tls12 :
-					AppConfig.SupportedFeatures.HasFlag(ServerFeatures.Tls11) ? SslProtocols.Tls11 :
-					SslProtocols.Tls;
+			var expectedProtocol = AppConfig.SupportedFeatures.HasFlag(ServerFeatures.Tls12) ? SslProtocols.Tls12 :
+				AppConfig.SupportedFeatures.HasFlag(ServerFeatures.Tls11) ? SslProtocols.Tls11 :
+				SslProtocols.Tls;
 #endif
-				var expectedProtocolString = expectedProtocol == SslProtocols.Tls12 ? "TLSv1.2" :
-					expectedProtocol == SslProtocols.Tls11 ? "TLSv1.1" : "TLSv1";
+			var expectedProtocolString = expectedProtocol == SslProtocols.Tls12 ? "TLSv1.2" :
+				expectedProtocol == SslProtocols.Tls11 ? "TLSv1.1" : "TLSv1";
+
+#if NETCOREAPP3_0
+			// https://docs.microsoft.com/en-us/dotnet/core/whats-new/dotnet-core-3-0#tls-13--openssl-111-on-linux
+			if (expectedProtocol == SslProtocols.Tls12 && AppConfig.SupportedFeatures.HasFlag(ServerFeatures.Tls13) && RuntimeInformation.IsOSPlatform(OSPlatform.Linux))
+			{
+				expectedProtocol = SslProtocols.Tls13;
+				expectedProtocolString = "TLSv1.3";
+			}
+#endif
 
 #if !BASELINE
-				Assert.Equal(expectedProtocol, connection.SslProtocol);
+			Assert.Equal(expectedProtocol, connection.SslProtocol);
 #endif
-				using (var cmd = new MySqlCommand("show status like 'Ssl_version';", connection))
-				using (var reader = await cmd.ExecuteReaderAsync())
-				{
-					Assert.True(reader.Read());
-					Assert.Equal(expectedProtocolString, reader.GetString(1));
-				}
-			}
+			using var cmd = new MySqlCommand("show status like 'Ssl_version';", connection);
+			using var reader = await cmd.ExecuteReaderAsync();
+			Assert.True(reader.Read());
+			Assert.Equal(expectedProtocolString, reader.GetString(1));
 		}
 
 		readonly DatabaseFixture m_database;

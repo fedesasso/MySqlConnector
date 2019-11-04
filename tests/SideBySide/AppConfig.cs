@@ -20,27 +20,37 @@ namespace SideBySide
 
 		public static string CertsPath => Path.GetFullPath(Config.GetValue<string>("Data:CertificatesPath"));
 
-		private static IConfiguration ConfigBuilder { get; } = new ConfigurationBuilder()
-			.AddInMemoryCollection(DefaultConfig)
+		private static IConfiguration BuildConfiguration()
+		{
+			var builder = new ConfigurationBuilder()
+				.AddInMemoryCollection(DefaultConfig)
 #if NETCOREAPP1_1_2
-			.SetBasePath(Path.GetDirectoryName(typeof(AppConfig).GetTypeInfo().Assembly.Location))
+				.SetBasePath(Path.GetDirectoryName(typeof(AppConfig).GetTypeInfo().Assembly.Location))
 #elif NETCOREAPP2_0 || NETCOREAPP2_1
-			.SetBasePath(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location))
+				.SetBasePath(Path.GetDirectoryName(Assembly.GetExecutingAssembly().Location))
 #endif
-			.AddJsonFile("config.json")
-			.Build();
+				.AddJsonFile("config.json")
+				.AddEnvironmentVariables();
+			return builder.Build();
+		}
 
-		public static IConfiguration Config => ConfigBuilder;
+		public static IConfiguration Config { get; } = BuildConfiguration();
 
 		public static string ConnectionString => Config.GetValue<string>("Data:ConnectionString");
 
 		public static string PasswordlessUser => Config.GetValue<string>("Data:PasswordlessUser");
 
+		public static string GSSAPIUser => Config.GetValue<string>("Data:GSSAPIUser");
+
+		public static bool HasKerberos => Config.GetValue<bool>("Data:HasKerberos");
+
 		public static string SecondaryDatabase => Config.GetValue<string>("Data:SecondaryDatabase");
+
+		public static string SocketPath => Config.GetValue<string>("Data:SocketPath");
 
 		private static ServerFeatures UnsupportedFeatures => (ServerFeatures) Enum.Parse(typeof(ServerFeatures), Config.GetValue<string>("Data:UnsupportedFeatures"));
 
-		public static ServerFeatures SupportedFeatures => ~ServerFeatures.None & ~UnsupportedFeatures;
+		public static ServerFeatures SupportedFeatures => ~ServerFeatures.None & ~UnsupportedFeatures & ~(IsCiBuild ? ServerFeatures.Timeout : ServerFeatures.None);
 
 		public static bool SupportsJson => SupportedFeatures.HasFlag(ServerFeatures.Json);
 
@@ -69,7 +79,21 @@ namespace SideBySide
 			return csb;
 		}
 
+		public static MySqlConnectionStringBuilder CreateGSSAPIConnectionStringBuilder()
+		{
+			var csb = CreateConnectionStringBuilder();
+			csb.UserID = GSSAPIUser;
+			csb.Database = null;
+			return csb;
+		}
+
+		public static bool IsCiBuild =>
+			Environment.GetEnvironmentVariable("APPVEYOR") == "True" ||
+			Environment.GetEnvironmentVariable("TRAVIS") == "true" ||
+			Environment.GetEnvironmentVariable("TF_BUILD") == "True";
+
 		// tests can run much slower in CI environments
-		public static int TimeoutDelayFactor { get; } = Environment.GetEnvironmentVariable("APPVEYOR") == "True" || Environment.GetEnvironmentVariable("TRAVIS") == "true" ? 6 : 1;
+		public static int TimeoutDelayFactor { get; } = Environment.GetEnvironmentVariable("APPVEYOR") == "True" || Environment.GetEnvironmentVariable("TRAVIS") == "true" ? 6 :
+			Environment.GetEnvironmentVariable("TF_BUILD") == "True" ? 10 : 1;
 	}
 }

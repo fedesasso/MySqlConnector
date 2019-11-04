@@ -1,3 +1,4 @@
+using System;
 using MySqlConnector.Protocol.Serialization;
 
 namespace MySqlConnector.Protocol.Payloads
@@ -8,15 +9,15 @@ namespace MySqlConnector.Protocol.Payloads
 		public int ColumnCount { get; }
 		public int ParameterCount { get; }
 
-		public static StatementPrepareResponsePayload Create(PayloadData payload)
+		public static StatementPrepareResponsePayload Create(ReadOnlySpan<byte> span)
 		{
-			var reader = new ByteArrayReader(payload.ArraySegment);
+			var reader = new ByteArrayReader(span);
 			reader.ReadByte(0);
 			var statementId = reader.ReadInt32();
-			var columnCount = (int) reader.ReadInt16();
-			var parameterCount = (int) reader.ReadInt16();
+			var columnCount = (int) reader.ReadUInt16();
+			var parameterCount = (int) reader.ReadUInt16();
 			reader.ReadByte(0);
-			var warningCount = (int) reader.ReadInt16();
+			var warningCount = (int) reader.ReadInt16(); // lgtm[cs/useless-assignment-to-local]
 
 			return new StatementPrepareResponsePayload(statementId, columnCount, parameterCount);
 		}

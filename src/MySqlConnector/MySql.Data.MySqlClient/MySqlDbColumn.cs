@@ -7,6 +7,7 @@ using MySqlConnector.Protocol.Payloads;
 using MySqlConnector.Protocol.Serialization;
 
 #if NET45
+#nullable disable
 namespace System.Data.Common
 {
 	public abstract class DbColumn
@@ -37,6 +38,7 @@ namespace System.Data.Common
 		public virtual object this[string property] => null;
 	}
 }
+#nullable enable
 #endif
 
 namespace MySql.Data.MySqlClient

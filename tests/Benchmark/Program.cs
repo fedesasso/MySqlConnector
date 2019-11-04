@@ -24,8 +24,10 @@ namespace Benchmark
 				.With(JitOptimizationsValidator.FailOnError)
 				.With(MemoryDiagnoser.Default)
 				.With(StatisticColumn.AllStatistics)
-				.With(Job.Default.With(Runtime.Clr).With(Jit.RyuJit).With(Platform.X64).With(CsProjClassicNetToolchain.Net472).WithId("net472"))
-				.With(Job.Default.With(Runtime.Core).With(CsProjCoreToolchain.NetCoreApp21).WithId("netcore21"))
+				.With(Job.Default.With(Runtime.Clr).With(Jit.RyuJit).With(Platform.X64).With(CsProjClassicNetToolchain.Net472).WithNuGet("MySqlConnector", "0.56.0").WithId("net472 0.56.0"))
+				.With(Job.Default.With(Runtime.Clr).With(Jit.RyuJit).With(Platform.X64).With(CsProjClassicNetToolchain.Net472).WithNuGet("MySqlConnector", "0.57.0-beta2").WithId("net472 0.57.0"))
+				.With(Job.Default.With(Runtime.Core).With(CsProjCoreToolchain.NetCoreApp21).WithNuGet("MySqlConnector", "0.56.0").WithId("netcore21 0.56.0"))
+				.With(Job.Default.With(Runtime.Core).With(CsProjCoreToolchain.NetCoreApp21).WithNuGet("MySqlConnector", "0.57.0-beta2").WithId("netcore21 0.57.0"))
 				.With(DefaultExporters.Csv);
 
 			var summary = BenchmarkRunner.Run<MySqlClient>(customConfig);
@@ -181,7 +183,7 @@ insert into benchmark.blobs(`Blob`) values(null), (@Blob1), (@Blob2);";
 		}
 
 		// TODO: move to config file
-		static string s_connectionString = "server=127.0.0.1;user id=mysqltest;password='test;key=\"val';port=3306;ssl mode=none;Use Affected Rows=true;Connection Reset=false;Default Command Timeout=0;AutoEnlist=false;";
+		static string s_connectionString = "server=127.0.0.1;user id=mysqltest;password=test;port=3306;ssl mode=none;Use Affected Rows=true;Connection Reset=false;Default Command Timeout=0;AutoEnlist=false;";
 
 		MySqlConnection m_connection;
 	}

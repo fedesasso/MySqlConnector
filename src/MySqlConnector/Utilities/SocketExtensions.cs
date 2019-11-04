@@ -1,10 +1,12 @@
 using System;
 using System.Net.Sockets;
+using System.Runtime.InteropServices;
 
 namespace MySqlConnector.Utilities
 {
 	internal static class SocketExtensions
 	{
+#if !NETSTANDARD2_1 && !NETCOREAPP3_0
 		public static SocketAwaitable ReceiveAsync(this Socket socket, SocketAwaitable awaitable)
 		{
 			awaitable.Reset();
@@ -20,6 +22,23 @@ namespace MySqlConnector.Utilities
 				awaitable.WasCompleted = true;
 			return awaitable;
 		}
+#endif
+
+#if !NETSTANDARD2_1 && !NETCOREAPP2_1 && !NETCOREAPP3_0
+		public static void SetBuffer(this SocketAsyncEventArgs args, Memory<byte> buffer)
+		{
+			MemoryMarshal.TryGetArray<byte>(buffer, out var arraySegment);
+			args.SetBuffer(arraySegment.Array, arraySegment.Offset, arraySegment.Count);
+		}
+
+		public static int Send(this Socket socket, ReadOnlyMemory<byte> data, SocketFlags flags)
+		{
+			MemoryMarshal.TryGetArray(data, out var arraySegment);
+			return socket.Send(arraySegment.Array, arraySegment.Offset, arraySegment.Count, flags);
+		}
+#else
+		public static int Send(this Socket socket, ReadOnlyMemory<byte> data, SocketFlags flags) => socket.Send(data.Span, flags);
+#endif
 
 		public static void SetKeepAlive(this Socket socket, uint keepAliveTimeSeconds)
 		{

@@ -16,12 +16,12 @@ namespace MySql.Data.MySqlClient
 #endif
 	{
 		public static void DeriveParameters(MySqlCommand command) => DeriveParametersAsync(IOBehavior.Synchronous, command, CancellationToken.None).GetAwaiter().GetResult();
-		public static Task DeriveParametersAsync(MySqlCommand command) => DeriveParametersAsync(command?.Connection?.AsyncIOBehavior ?? IOBehavior.Asynchronous, command, CancellationToken.None);
-		public static Task DeriveParametersAsync(MySqlCommand command, CancellationToken cancellationToken) => DeriveParametersAsync(command?.Connection?.AsyncIOBehavior ?? IOBehavior.Asynchronous, command, cancellationToken);
+		public static Task DeriveParametersAsync(MySqlCommand command) => DeriveParametersAsync(command?.Connection?.AsyncIOBehavior ?? IOBehavior.Asynchronous, command!, CancellationToken.None);
+		public static Task DeriveParametersAsync(MySqlCommand command, CancellationToken cancellationToken) => DeriveParametersAsync(command?.Connection?.AsyncIOBehavior ?? IOBehavior.Asynchronous, command!, cancellationToken);
 
 		private static async Task DeriveParametersAsync(IOBehavior ioBehavior, MySqlCommand command, CancellationToken cancellationToken)
 		{
-			if (command == null)
+			if (command is null)
 				throw new ArgumentNullException(nameof(command));
 			if (command.CommandType != CommandType.StoredProcedure)
 				throw new ArgumentException("MySqlCommand.CommandType must be StoredProcedure not {0}".FormatInvariant(command.CommandType), nameof(command));
@@ -32,10 +32,10 @@ namespace MySql.Data.MySqlClient
 			if (command.Connection.Session.ServerVersion.Version < ServerVersions.SupportsProcedureCache)
 				throw new NotSupportedException("MySQL Server {0} doesn't support INFORMATION_SCHEMA".FormatInvariant(command.Connection.Session.ServerVersion.OriginalString));
 
-			var cachedProcedure = await command.Connection.GetCachedProcedure(ioBehavior, command.CommandText, cancellationToken).ConfigureAwait(false);
-			if (cachedProcedure == null)
+			var cachedProcedure = await command.Connection.GetCachedProcedure(command.CommandText!, revalidateMissing: true, ioBehavior, cancellationToken).ConfigureAwait(false);
+			if (cachedProcedure is null)
 			{
-				var name = NormalizedSchema.MustNormalize(command.CommandText, command.Connection.Database);
+				var name = NormalizedSchema.MustNormalize(command.CommandText!, command.Connection.Database);
 				throw new MySqlException("Procedure or function '{0}' cannot be found in database '{1}'.".FormatInvariant(name.Component, name.Schema));
 			}
 

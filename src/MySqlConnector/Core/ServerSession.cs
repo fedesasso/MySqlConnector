@@ -19,6 +19,7 @@ using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using MySql.Data.MySqlClient;
+using MySqlConnector.Authentication;
 using MySqlConnector.Logging;
 using MySqlConnector.Protocol;
 using MySqlConnector.Protocol.Payloads;
@@ -34,32 +35,36 @@ namespace MySqlConnector.Core
 		{
 		}
 
-		public ServerSession(ConnectionPool pool, int poolGeneration, int id)
+		public ServerSession(ConnectionPool? pool, int poolGeneration, int id)
 		{
 			m_lock = new object();
 			m_payloadCache = new ArraySegmentHolder<byte>();
 			Id = (pool?.Id ?? 0) + "." + id;
+			ServerVersion = ServerVersion.Empty;
 			CreatedTicks = unchecked((uint) Environment.TickCount);
 			Pool = pool;
 			PoolGeneration = poolGeneration;
 			HostName = "";
-			m_logArguments = new object[] { "{0}".FormatInvariant(Id), null };
+			m_logArguments = new object?[] { "{0}".FormatInvariant(Id), null };
 			Log.Debug("Session{0} created new session", m_logArguments);
 		}
 
 		public string Id { get; }
 		public ServerVersion ServerVersion { get; set; }
 		public int ConnectionId { get; set; }
-		public byte[] AuthPluginData { get; set; }
+		public byte[]? AuthPluginData { get; set; }
 		public uint CreatedTicks { get; }
-		public ConnectionPool Pool { get; }
+		public ConnectionPool? Pool { get; }
 		public int PoolGeneration { get; }
 		public uint LastReturnedTicks { get; private set; }
-		public string DatabaseOverride { get; set; }
+		public string? DatabaseOverride { get; set; }
 		public string HostName { get; private set; }
-		public IPAddress IPAddress => (m_tcpClient?.Client.RemoteEndPoint as IPEndPoint)?.Address;
-		public WeakReference<MySqlConnection> OwningConnection { get; set; }
+		public IPAddress? IPAddress => (m_tcpClient?.Client.RemoteEndPoint as IPEndPoint)?.Address;
+		public WeakReference<MySqlConnection>? OwningConnection { get; set; }
+		public bool SupportsComMulti => m_supportsComMulti;
 		public bool SupportsDeprecateEof => m_supportsDeprecateEof;
+		public bool SupportsSessionTrack => m_supportsSessionTrack;
+		public bool ProcAccessDenied { get; set; }
 
 		public void ReturnToPool()
 		{
@@ -81,7 +86,7 @@ namespace MySqlConnector.Core
 			}
 		}
 
-		public bool TryStartCancel(MySqlCommand command)
+		public bool TryStartCancel(ICancellableCommand command)
 		{
 			lock (m_lock)
 			{
@@ -95,13 +100,13 @@ namespace MySqlConnector.Core
 				m_state = State.CancelingQuery;
 			}
 
-			Log.Info("Session{0} will cancel CommandId: {1} (CancelledAttempts={2}) CommandText: {3}", m_logArguments[0], command.CommandId, command.CancelAttemptCount, command.CommandText);
+			Log.Info("Session{0} will cancel CommandId: {1} (CancelledAttempts={2}) CommandText: {3}", m_logArguments[0], command.CommandId, command.CancelAttemptCount, (command as MySqlCommand)?.CommandText);
 			return true;
 		}
 
-		public void DoCancel(MySqlCommand commandToCancel, MySqlCommand killCommand)
+		public void DoCancel(ICancellableCommand commandToCancel, MySqlCommand killCommand)
 		{
-			Log.Info("Session{0} canceling CommandId {1}: CommandText: {2}", m_logArguments[0], commandToCancel.CommandId, commandToCancel.CommandText);
+			Log.Info("Session{0} canceling CommandId {1}: CommandText: {2}", m_logArguments[0], commandToCancel.CommandId, (commandToCancel as MySqlCommand)?.CommandText);
 			lock (m_lock)
 			{
 				if (m_activeCommandId != commandToCancel.CommandId)
@@ -118,7 +123,7 @@ namespace MySqlConnector.Core
 			}
 		}
 
-		public void AbortCancel(MySqlCommand command)
+		public void AbortCancel(ICancellableCommand command)
 		{
 			lock (m_lock)
 			{
@@ -127,16 +132,76 @@ namespace MySqlConnector.Core
 			}
 		}
 
-		public void AddPreparedStatement(string commandText, PreparedStatements preparedStatements)
+		public bool IsCancelingQuery => m_state == State.CancelingQuery;
+
+		public async Task PrepareAsync(IMySqlCommand command, IOBehavior ioBehavior, CancellationToken cancellationToken)
 		{
-			if (m_preparedStatements == null)
-				m_preparedStatements = new Dictionary<string, PreparedStatements>();
-			m_preparedStatements.Add(commandText, preparedStatements);
+			// caller has validated this already
+			var commandText = command.CommandText!;
+
+			var statementPreparer = new StatementPreparer(commandText, command.RawParameters, command.CreateStatementPreparerOptions());
+			var parsedStatements = statementPreparer.SplitStatements();
+
+			var columnsAndParameters = new ResizableArray<byte>();
+			var columnsAndParametersSize = 0;
+
+			var preparedStatements = new List<PreparedStatement>(parsedStatements.Statements.Count);
+			foreach (var statement in parsedStatements.Statements)
+			{
+				await SendAsync(new PayloadData(statement.StatementBytes), ioBehavior, cancellationToken).ConfigureAwait(false);
+				var payload = await ReceiveReplyAsync(ioBehavior, cancellationToken).ConfigureAwait(false);
+				var response = StatementPrepareResponsePayload.Create(payload.Span);
+
+				ColumnDefinitionPayload[]? parameters = null;
+				if (response.ParameterCount > 0)
+				{
+					parameters = new ColumnDefinitionPayload[response.ParameterCount];
+					for (var i = 0; i < response.ParameterCount; i++)
+					{
+						payload = await ReceiveReplyAsync(ioBehavior, cancellationToken).ConfigureAwait(false);
+						var payloadLength = payload.Span.Length;
+						Utility.Resize(ref columnsAndParameters, columnsAndParametersSize + payloadLength);
+						payload.Span.CopyTo(columnsAndParameters.Array.AsSpan().Slice(columnsAndParametersSize));
+						parameters[i] = ColumnDefinitionPayload.Create(new ResizableArraySegment<byte>(columnsAndParameters, columnsAndParametersSize, payloadLength));
+						columnsAndParametersSize += payloadLength;
+					}
+					if (!SupportsDeprecateEof)
+					{
+						payload = await ReceiveReplyAsync(ioBehavior, cancellationToken).ConfigureAwait(false);
+						EofPayload.Create(payload.Span);
+					}
+				}
+
+				ColumnDefinitionPayload[]? columns = null;
+				if (response.ColumnCount > 0)
+				{
+					columns = new ColumnDefinitionPayload[response.ColumnCount];
+					for (var i = 0; i < response.ColumnCount; i++)
+					{
+						payload = await ReceiveReplyAsync(ioBehavior, cancellationToken).ConfigureAwait(false);
+						var payloadLength = payload.Span.Length;
+						Utility.Resize(ref columnsAndParameters, columnsAndParametersSize + payloadLength);
+						payload.Span.CopyTo(columnsAndParameters.Array.AsSpan().Slice(columnsAndParametersSize));
+						columns[i] = ColumnDefinitionPayload.Create(new ResizableArraySegment<byte>(columnsAndParameters, columnsAndParametersSize, payloadLength));
+						columnsAndParametersSize += payloadLength;
+					}
+					if (!SupportsDeprecateEof)
+					{
+						payload = await ReceiveReplyAsync(ioBehavior, cancellationToken).ConfigureAwait(false);
+						EofPayload.Create(payload.Span);
+					}
+				}
+
+				preparedStatements.Add(new PreparedStatement(response.StatementId, statement, columns, parameters));
+			}
+
+			m_preparedStatements ??= new Dictionary<string, PreparedStatements>();
+			m_preparedStatements.Add(commandText, new PreparedStatements(preparedStatements, parsedStatements));
 		}
 
-		public PreparedStatements TryGetPreparedStatement(string commandText)
+		public PreparedStatements? TryGetPreparedStatement(string commandText)
 		{
-			if (m_preparedStatements != null)
+			if (m_preparedStatements is object)
 			{
 				if (m_preparedStatements.TryGetValue(commandText, out var statement))
 					return statement;
@@ -144,19 +209,20 @@ namespace MySqlConnector.Core
 			return null;
 		}
 
-		public void StartQuerying(MySqlCommand command)
+		public void StartQuerying(ICancellableCommand command)
 		{
 			lock (m_lock)
 			{
 				if (m_state == State.Querying || m_state == State.CancelingQuery)
 				{
 					m_logArguments[1] = m_state;
-					Log.Error("Session{0} can't execute new command when in SessionState: {1}: CommandText: {2}", m_logArguments[0], m_state, command.CommandText);
-					throw new InvalidOperationException("There is already an open DataReader associated with this Connection which must be closed first.");
+					Log.Error("Session{0} can't execute new command when in SessionState: {1}", m_logArguments[0], m_state);
+					throw new InvalidOperationException("This MySqlConnection is already in use. See https://fl.vu/mysql-conn-reuse");
 				}
 
 				VerifyState(State.Connected);
 				m_state = State.Querying;
+
 				command.CancelAttemptCount = 0;
 				m_activeCommandId = command.CommandId;
 			}
@@ -185,7 +251,7 @@ namespace MySqlConnector.Core
 				var payload = QueryPayload.Create("DO SLEEP(0);");
 				SendAsync(payload, IOBehavior.Synchronous, CancellationToken.None).GetAwaiter().GetResult();
 				payload = ReceiveReplyAsync(IOBehavior.Synchronous, CancellationToken.None).GetAwaiter().GetResult();
-				OkPayload.Create(payload);
+				OkPayload.Create(payload.Span, SupportsDeprecateEof, SupportsSessionTrack);
 			}
 
 			lock (m_lock)
@@ -198,11 +264,11 @@ namespace MySqlConnector.Core
 			}
 		}
 
-		public void SetTimeout(int timeoutMilliseconds) => m_payloadHandler.ByteHandler.RemainingTimeout = timeoutMilliseconds;
+		public void SetTimeout(int timeoutMilliseconds) => m_payloadHandler!.ByteHandler.RemainingTimeout = timeoutMilliseconds;
 
 		public async Task DisposeAsync(IOBehavior ioBehavior, CancellationToken cancellationToken)
 		{
-			if (m_payloadHandler != null)
+			if (m_payloadHandler is object)
 			{
 				// attempt to gracefully close the connection, ignoring any errors (it may have been closed already by the server, etc.)
 				State state;
@@ -219,7 +285,7 @@ namespace MySqlConnector.Core
 					{
 						Log.Info("Session{0} sending QUIT command", m_logArguments);
 						m_payloadHandler.StartNewConversation();
-						await m_payloadHandler.WritePayloadAsync(QuitPayload.Instance.ArraySegment, ioBehavior).ConfigureAwait(false);
+						await m_payloadHandler.WritePayloadAsync(QuitPayload.Instance.Memory, ioBehavior).ConfigureAwait(false);
 					}
 					catch (IOException)
 					{
@@ -243,7 +309,7 @@ namespace MySqlConnector.Core
 				m_state = State.Closed;
 		}
 
-		public async Task ConnectAsync(ConnectionSettings cs, ILoadBalancer loadBalancer, IOBehavior ioBehavior, CancellationToken cancellationToken)
+		public async Task ConnectAsync(ConnectionSettings cs, ILoadBalancer? loadBalancer, IOBehavior ioBehavior, CancellationToken cancellationToken)
 		{
 			try
 			{
@@ -269,7 +335,7 @@ namespace MySqlConnector.Core
 
 					var connected = false;
 					if (cs.ConnectionProtocol == MySqlConnectionProtocol.Sockets)
-						connected = await OpenTcpSocketAsync(cs, loadBalancer, ioBehavior, cancellationToken).ConfigureAwait(false);
+						connected = await OpenTcpSocketAsync(cs, loadBalancer ?? throw new ArgumentNullException(nameof(loadBalancer)), ioBehavior, cancellationToken).ConfigureAwait(false);
 					else if (cs.ConnectionProtocol == MySqlConnectionProtocol.UnixSocket)
 						connected = await OpenUnixSocketAsync(cs, ioBehavior, cancellationToken).ConfigureAwait(false);
 					else if (cs.ConnectionProtocol == MySqlConnectionProtocol.NamedPipe)
@@ -279,19 +345,19 @@ namespace MySqlConnector.Core
 						lock (m_lock)
 							m_state = State.Failed;
 						Log.Error("Session{0} connecting failed", m_logArguments);
-						throw new MySqlException("Unable to connect to any of the specified MySQL hosts.");
+						throw new MySqlException(MySqlErrorCode.UnableToConnectToHost, "Unable to connect to any of the specified MySQL hosts.");
 					}
 
-					var byteHandler = m_socket != null ? (IByteHandler) new SocketByteHandler(m_socket) : new StreamByteHandler(m_stream);
+					var byteHandler = m_socket is null ? new StreamByteHandler(m_stream!) : (IByteHandler) new SocketByteHandler(m_socket);
 					m_payloadHandler = new StandardPayloadHandler(byteHandler);
 
 					payload = await ReceiveAsync(ioBehavior, cancellationToken).ConfigureAwait(false);
-					initialHandshake = InitialHandshakePayload.Create(payload);
+					initialHandshake = InitialHandshakePayload.Create(payload.Span);
 
 					// if PluginAuth is supported, then use the specified auth plugin; else, fall back to protocol capabilities to determine the auth type to use
 					string authPluginName;
 					if ((initialHandshake.ProtocolCapabilities & ProtocolCapabilities.PluginAuth) != 0)
-						authPluginName = initialHandshake.AuthPluginName;
+						authPluginName = initialHandshake.AuthPluginName!;
 					else
 						authPluginName = (initialHandshake.ProtocolCapabilities & ProtocolCapabilities.SecureConnection) == 0 ? "mysql_old_password" : "mysql_native_password";
 					m_logArguments[1] = authPluginName;
@@ -302,25 +368,29 @@ namespace MySqlConnector.Core
 						throw new NotSupportedException("Authentication method '{0}' is not supported.".FormatInvariant(initialHandshake.AuthPluginName));
 					}
 
-					ServerVersion = new ServerVersion(Encoding.ASCII.GetString(initialHandshake.ServerVersion));
+					ServerVersion = new ServerVersion(initialHandshake.ServerVersion);
 					ConnectionId = initialHandshake.ConnectionId;
 					AuthPluginData = initialHandshake.AuthPluginData;
 					m_useCompression = cs.UseCompression && (initialHandshake.ProtocolCapabilities & ProtocolCapabilities.Compress) != 0;
 
+					m_supportsComMulti = (initialHandshake.ProtocolCapabilities & ProtocolCapabilities.MariaDbComMulti) != 0;
 					m_supportsConnectionAttributes = (initialHandshake.ProtocolCapabilities & ProtocolCapabilities.ConnectionAttributes) != 0;
 					m_supportsDeprecateEof = (initialHandshake.ProtocolCapabilities & ProtocolCapabilities.DeprecateEof) != 0;
+					m_supportsSessionTrack = (initialHandshake.ProtocolCapabilities & ProtocolCapabilities.SessionTrack) != 0;
 					var serverSupportsSsl = (initialHandshake.ProtocolCapabilities & ProtocolCapabilities.Ssl) != 0;
+					m_characterSet = ServerVersion.Version >= ServerVersions.SupportsUtf8Mb4 ? CharacterSet.Utf8Mb4GeneralCaseInsensitive : CharacterSet.Utf8GeneralCaseInsensitive;
+					m_setNamesPayload = ServerVersion.Version >= ServerVersions.SupportsUtf8Mb4 ? s_setNamesUtf8mb4Payload : s_setNamesUtf8Payload;
 
-					Log.Info("Session{0} made connection; ServerVersion={1}; ConnectionId={2}; Compression={3}; Attributes={4}; DeprecateEof={5}; Ssl={6}",
+					Log.Info("Session{0} made connection; ServerVersion={1}; ConnectionId={2}; Compression={3}; Attributes={4}; DeprecateEof={5}; Ssl={6}; SessionTrack={7}",
 						m_logArguments[0], ServerVersion.OriginalString, ConnectionId,
-						m_useCompression, m_supportsConnectionAttributes, m_supportsDeprecateEof, serverSupportsSsl);
+						m_useCompression, m_supportsConnectionAttributes, m_supportsDeprecateEof, serverSupportsSsl, m_supportsSessionTrack);
 
 					if (cs.SslMode != MySqlSslMode.None && (cs.SslMode != MySqlSslMode.Preferred || serverSupportsSsl))
 					{
 						if (!serverSupportsSsl)
 						{
 							Log.Error("Session{0} requires SSL but server doesn't support it", m_logArguments);
-							throw new MySqlException("Server does not support SSL");
+							throw new MySqlException(MySqlErrorCode.UnableToConnectToHost, "Server does not support SSL");
 						}
 
 						try
@@ -338,7 +408,7 @@ namespace MySqlConnector.Core
 							// negotiating TLS 1.2 with a yaSSL-based server throws an exception on Windows, see comment at top of method
 							Log.Warn(ex, "Session{0} failed negotiating TLS; falling back to TLS 1.1", m_logArguments);
 							sslProtocols = SslProtocols.Tls | SslProtocols.Tls11;
-							if (Pool != null)
+							if (Pool is object)
 								Pool.SslProtocols = sslProtocols;
 						}
 					}
@@ -348,10 +418,10 @@ namespace MySqlConnector.Core
 					}
 				} while (shouldRetrySsl);
 
-				if (m_supportsConnectionAttributes && cs.ConnectionAttributes == null)
+				if (m_supportsConnectionAttributes && cs.ConnectionAttributes is null)
 					cs.ConnectionAttributes = CreateConnectionAttributes(cs.ApplicationName);
 
-				using (var handshakeResponsePayload = HandshakeResponse41Payload.Create(initialHandshake, cs, m_useCompression, m_supportsConnectionAttributes ? cs.ConnectionAttributes : null))
+				using (var handshakeResponsePayload = HandshakeResponse41Payload.Create(initialHandshake, cs, m_useCompression, m_characterSet, m_supportsConnectionAttributes ? cs.ConnectionAttributes : null))
 					await SendReplyAsync(handshakeResponsePayload, ioBehavior, cancellationToken).ConfigureAwait(false);
 				payload = await ReceiveReplyAsync(ioBehavior, cancellationToken).ConfigureAwait(false);
 
@@ -361,23 +431,28 @@ namespace MySqlConnector.Core
 					payload = await SwitchAuthenticationAsync(cs, payload, ioBehavior, cancellationToken).ConfigureAwait(false);
 				}
 
-				OkPayload.Create(payload);
+				OkPayload.Create(payload.Span, SupportsDeprecateEof, SupportsSessionTrack);
 
 				if (m_useCompression)
 					m_payloadHandler = new CompressedPayloadHandler(m_payloadHandler.ByteHandler);
 
-				if (ShouldGetRealServerDetails())
+				// set 'collation_connection' to the server default
+				await SendAsync(m_setNamesPayload, ioBehavior, cancellationToken).ConfigureAwait(false);
+				payload = await ReceiveReplyAsync(ioBehavior, cancellationToken).ConfigureAwait(false);
+				OkPayload.Create(payload.Span, SupportsDeprecateEof, SupportsSessionTrack);
+
+				if (ShouldGetRealServerDetails(cs))
 					await GetRealServerDetailsAsync(ioBehavior, CancellationToken.None).ConfigureAwait(false);
 			}
 			catch (ArgumentException ex)
 			{
 				Log.Error(ex, "Session{0} couldn't connect to server", m_logArguments);
-				throw new MySqlException("Couldn't connect to server", ex);
+				throw new MySqlException(MySqlErrorCode.UnableToConnectToHost, "Couldn't connect to server", ex);
 			}
 			catch (IOException ex)
 			{
 				Log.Error(ex, "Session{0} couldn't connect to server", m_logArguments);
-				throw new MySqlException("Couldn't connect to server", ex);
+				throw new MySqlException(MySqlErrorCode.UnableToConnectToHost, "Couldn't connect to server", ex);
 			}
 		}
 
@@ -390,23 +465,19 @@ namespace MySqlConnector.Core
 				// clear all prepared statements; resetting the connection will clear them on the server
 				ClearPreparedStatements();
 
-				if (DatabaseOverride == null && ServerVersion.Version.CompareTo(ServerVersions.SupportsResetConnection) >= 0)
+				PayloadData payload;
+				if (DatabaseOverride is null && (ServerVersion.Version.CompareTo(ServerVersions.SupportsResetConnection) >= 0 || ServerVersion.MariaDbVersion?.CompareTo(ServerVersions.MariaDbSupportsResetConnection) >= 0))
 				{
 					m_logArguments[1] = ServerVersion.OriginalString;
 					Log.Debug("Session{0} ServerVersion={1} supports reset connection; sending reset connection request", m_logArguments);
 					await SendAsync(ResetConnectionPayload.Instance, ioBehavior, cancellationToken).ConfigureAwait(false);
-					var payload = await ReceiveReplyAsync(ioBehavior, cancellationToken).ConfigureAwait(false);
-					OkPayload.Create(payload);
-
-					// the "reset connection" packet also resets the connection charset, so we need to change that back to our default
-					await SendAsync(s_setNamesUtf8mb4Payload, ioBehavior, cancellationToken).ConfigureAwait(false);
 					payload = await ReceiveReplyAsync(ioBehavior, cancellationToken).ConfigureAwait(false);
-					OkPayload.Create(payload);
+					OkPayload.Create(payload.Span, SupportsDeprecateEof, SupportsSessionTrack);
 				}
 				else
 				{
 					// optimistically hash the password with the challenge from the initial handshake (supported by MariaDB; doesn't appear to be supported by MySQL)
-					if (DatabaseOverride == null)
+					if (DatabaseOverride is null)
 					{
 						m_logArguments[1] = ServerVersion.OriginalString;
 						Log.Debug("Session{0} ServerVersion={1} doesn't support reset connection; sending change user request", m_logArguments);
@@ -417,17 +488,22 @@ namespace MySqlConnector.Core
 						Log.Debug("Session{0} sending change user request due to changed Database={1}", m_logArguments);
 						DatabaseOverride = null;
 					}
-					var hashedPassword = AuthenticationUtility.CreateAuthenticationResponse(AuthPluginData, 0, cs.Password);
-					using (var changeUserPayload = ChangeUserPayload.Create(cs.UserID, hashedPassword, cs.Database, m_supportsConnectionAttributes ? cs.ConnectionAttributes : null))
+					var hashedPassword = AuthenticationUtility.CreateAuthenticationResponse(AuthPluginData!, 0, cs.Password);
+					using (var changeUserPayload = ChangeUserPayload.Create(cs.UserID, hashedPassword, cs.Database, m_characterSet, m_supportsConnectionAttributes ? cs.ConnectionAttributes : null))
 						await SendAsync(changeUserPayload, ioBehavior, cancellationToken).ConfigureAwait(false);
-					var payload = await ReceiveReplyAsync(ioBehavior, cancellationToken).ConfigureAwait(false);
+					payload = await ReceiveReplyAsync(ioBehavior, cancellationToken).ConfigureAwait(false);
 					if (payload.HeaderByte == AuthenticationMethodSwitchRequestPayload.Signature)
 					{
 						Log.Debug("Session{0} optimistic reauthentication failed; logging in again", m_logArguments);
 						payload = await SwitchAuthenticationAsync(cs, payload, ioBehavior, cancellationToken).ConfigureAwait(false);
 					}
-					OkPayload.Create(payload);
+					OkPayload.Create(payload.Span, SupportsDeprecateEof, SupportsSessionTrack);
 				}
+
+				// set 'collation_connection' to the server default
+				await SendAsync(m_setNamesPayload, ioBehavior, cancellationToken).ConfigureAwait(false);
+				payload = await ReceiveReplyAsync(ioBehavior, cancellationToken).ConfigureAwait(false);
+				OkPayload.Create(payload.Span, SupportsDeprecateEof, SupportsSessionTrack);
 
 				return true;
 			}
@@ -446,7 +522,7 @@ namespace MySqlConnector.Core
 		private async Task<PayloadData> SwitchAuthenticationAsync(ConnectionSettings cs, PayloadData payload, IOBehavior ioBehavior, CancellationToken cancellationToken)
 		{
 			// if the server didn't support the hashed password; rehash with the new challenge
-			var switchRequest = AuthenticationMethodSwitchRequestPayload.Create(payload);
+			var switchRequest = AuthenticationMethodSwitchRequestPayload.Create(payload.Span);
 			m_logArguments[1] = switchRequest.Name;
 			Log.Debug("Session{0} switching to AuthenticationMethod '{1}'", m_logArguments);
 			switch (switchRequest.Name)
@@ -462,9 +538,12 @@ namespace MySqlConnector.Core
 				if (!m_isSecureConnection)
 				{
 					Log.Error("Session{0} needs a secure connection to use AuthenticationMethod '{1}'", m_logArguments);
-					throw new MySqlException("Authentication method '{0}' requires a secure connection.".FormatInvariant(switchRequest.Name));
+					throw new MySqlException(MySqlErrorCode.UnableToConnectToHost, "Authentication method '{0}' requires a secure connection.".FormatInvariant(switchRequest.Name));
 				}
-				payload = new PayloadData(Encoding.UTF8.GetBytes(cs.Password));
+				// send the password as a NULL-terminated UTF-8 string
+				var passwordBytes = Encoding.UTF8.GetBytes(cs.Password);
+				Array.Resize(ref passwordBytes, passwordBytes.Length + 1);
+				payload = new PayloadData(passwordBytes);
 				await SendReplyAsync(payload, ioBehavior, cancellationToken).ConfigureAwait(false);
 				return await ReceiveReplyAsync(ioBehavior, cancellationToken).ConfigureAwait(false);
 
@@ -475,10 +554,10 @@ namespace MySqlConnector.Core
 				payload = await ReceiveReplyAsync(ioBehavior, cancellationToken).ConfigureAwait(false);
 
 				// OK payload can be sent immediately (e.g., if password is empty( (short-circuiting the )
-				if (OkPayload.IsOk(payload, SupportsDeprecateEof))
+				if (OkPayload.IsOk(payload.Span, SupportsDeprecateEof))
 					return payload;
 
-				var cachingSha2ServerResponsePayload = CachingSha2ServerResponsePayload.Create(payload);
+				var cachingSha2ServerResponsePayload = CachingSha2ServerResponsePayload.Create(payload.Span);
 				if (cachingSha2ServerResponsePayload.Succeeded)
 					return await ReceiveReplyAsync(ioBehavior, cancellationToken).ConfigureAwait(false);
 
@@ -489,7 +568,7 @@ namespace MySqlConnector.Core
 				{
 #if NET45
 					Log.Error("Session{0} can't use AuthenticationMethod '{1}' without secure connection on .NET 4.5", m_logArguments);
-					throw new MySqlException("Authentication method '{0}' requires a secure connection (prior to .NET 4.6).".FormatInvariant(switchRequest.Name));
+					throw new MySqlException(MySqlErrorCode.UnableToConnectToHost, "Authentication method '{0}' requires a secure connection (prior to .NET 4.6).".FormatInvariant(switchRequest.Name));
 #else
 					var publicKey = await GetRsaPublicKeyAsync(switchRequest.Name, cs, ioBehavior, cancellationToken).ConfigureAwait(false);
 					return await SendEncryptedPasswordAsync(switchRequest, publicKey, cs, ioBehavior, cancellationToken).ConfigureAwait(false);
@@ -500,9 +579,19 @@ namespace MySqlConnector.Core
 					return await SendClearPasswordAsync(cs, ioBehavior, cancellationToken).ConfigureAwait(false);
 				}
 
+			case "auth_gssapi_client":
+				return await AuthGSSAPI.AuthenticateAsync(cs, switchRequest.Data, this, ioBehavior, cancellationToken).ConfigureAwait(false);
+
 			case "mysql_old_password":
 				Log.Error("Session{0} is requesting AuthenticationMethod '{1}' which is not supported", m_logArguments);
 				throw new NotSupportedException("'MySQL Server is requesting the insecure pre-4.1 auth mechanism (mysql_old_password). The user password must be upgraded; see https://dev.mysql.com/doc/refman/5.7/en/account-upgrades.html.");
+
+			case "client_ed25519":
+				if (!AuthenticationPlugins.TryGetPlugin(switchRequest.Name, out var ed25519Plugin))
+					throw new NotSupportedException("You must install the MySqlConnector.Authentication.Ed25519 package and call Ed25519AuthenticationPlugin.Install to use client_ed25519 authentication.");
+				payload = new PayloadData(ed25519Plugin.CreateResponse(cs.Password, switchRequest.Data));
+				await SendReplyAsync(payload, ioBehavior, cancellationToken).ConfigureAwait(false);
+				return await ReceiveReplyAsync(ioBehavior, cancellationToken).ConfigureAwait(false);
 
 			default:
 				Log.Error("Session{0} is requesting AuthenticationMethod '{1}' which is not supported", m_logArguments);
@@ -531,35 +620,35 @@ namespace MySqlConnector.Core
 			CancellationToken cancellationToken)
 		{
 			// load the RSA public key
-			RSA rsa;
+			RSAParameters rsaParameters;
 			try
 			{
-				rsa = Utility.DecodeX509PublicKey(rsaPublicKey);
+				rsaParameters = Utility.GetRsaParameters(rsaPublicKey);
 			}
 			catch (Exception ex)
 			{
 				Log.Error(ex, "Session{0} couldn't load server's RSA public key", m_logArguments);
-				throw new MySqlException("Couldn't load server's RSA public key; try using a secure connection instead.", ex);
+				throw new MySqlException(MySqlErrorCode.UnableToConnectToHost, "Couldn't load server's RSA public key; try using a secure connection instead.", ex);
 			}
 
 			// add NUL terminator to password
 			var passwordBytes = Encoding.UTF8.GetBytes(cs.Password);
 			Array.Resize(ref passwordBytes, passwordBytes.Length + 1);
 
-			using (rsa)
-			{
-				// XOR the password bytes with the challenge
-				AuthPluginData = Utility.TrimZeroByte(switchRequest.Data);
-				for (var i = 0; i < passwordBytes.Length; i++)
-					passwordBytes[i] ^= AuthPluginData[i % AuthPluginData.Length];
+			using var rsa = RSA.Create();
+			rsa.ImportParameters(rsaParameters);
 
-				// encrypt with RSA public key
-				var padding = RSAEncryptionPadding.OaepSHA1;
-				var encryptedPassword = rsa.Encrypt(passwordBytes, padding);
-				var payload = new PayloadData(encryptedPassword);
-				await SendReplyAsync(payload, ioBehavior, cancellationToken).ConfigureAwait(false);
-				return await ReceiveReplyAsync(ioBehavior, cancellationToken).ConfigureAwait(false);
-			}
+			// XOR the password bytes with the challenge
+			AuthPluginData = Utility.TrimZeroByte(switchRequest.Data);
+			for (var i = 0; i < passwordBytes.Length; i++)
+				passwordBytes[i] ^= AuthPluginData[i % AuthPluginData.Length];
+
+			// encrypt with RSA public key
+			var padding = RSAEncryptionPadding.OaepSHA1;
+			var encryptedPassword = rsa.Encrypt(passwordBytes, padding);
+			var payload = new PayloadData(encryptedPassword);
+			await SendReplyAsync(payload, ioBehavior, cancellationToken).ConfigureAwait(false);
+			return await ReceiveReplyAsync(ioBehavior, cancellationToken).ConfigureAwait(false);
 		}
 #endif
 
@@ -585,13 +674,13 @@ namespace MySqlConnector.Core
 				var payloadContent = switchRequestName == "caching_sha2_password" ? (byte) 0x02 : (byte) 0x01;
 				await SendReplyAsync(new PayloadData(new[] { payloadContent }), ioBehavior, cancellationToken).ConfigureAwait(false);
 				var payload = await ReceiveReplyAsync(ioBehavior, cancellationToken).ConfigureAwait(false);
-				var publicKeyPayload = AuthenticationMoreDataPayload.Create(payload);
+				var publicKeyPayload = AuthenticationMoreDataPayload.Create(payload.Span);
 				return Encoding.ASCII.GetString(publicKeyPayload.Data);
 			}
 
 			m_logArguments[1] = switchRequestName;
 			Log.Error("Session{0} couldn't use AuthenticationMethod '{1}' because RSA key wasn't specified or couldn't be retrieved", m_logArguments);
-			throw new MySqlException("Authentication method '{0}' failed. Either use a secure connection, specify the server's RSA public key with ServerRSAPublicKeyFile, or set AllowPublicKeyRetrieval=True.".FormatInvariant(switchRequestName));
+			throw new MySqlException(MySqlErrorCode.UnableToConnectToHost, "Authentication method '{0}' failed. Either use a secure connection, specify the server's RSA public key with ServerRSAPublicKeyFile, or set AllowPublicKeyRetrieval=True.".FormatInvariant(switchRequestName));
 		}
 
 		public async ValueTask<bool> TryPingAsync(IOBehavior ioBehavior, CancellationToken cancellationToken)
@@ -604,7 +693,7 @@ namespace MySqlConnector.Core
 				Log.Debug("Session{0} pinging server", m_logArguments);
 				await SendAsync(PingPayload.Instance, ioBehavior, cancellationToken).ConfigureAwait(false);
 				var payload = await ReceiveReplyAsync(ioBehavior, cancellationToken).ConfigureAwait(false);
-				OkPayload.Create(payload);
+				OkPayload.Create(payload.Span, SupportsDeprecateEof, SupportsSessionTrack);
 				Log.Info("Session{0} successfully pinged server", m_logArguments);
 				return true;
 			}
@@ -624,14 +713,14 @@ namespace MySqlConnector.Core
 		// Starts a new conversation with the server by sending the first packet.
 		public ValueTask<int> SendAsync(PayloadData payload, IOBehavior ioBehavior, CancellationToken cancellationToken)
 		{
-			m_payloadHandler.StartNewConversation();
+			m_payloadHandler!.StartNewConversation();
 			return SendReplyAsync(payload, ioBehavior, cancellationToken);
 		}
 
 		// Starts a new conversation with the server by receiving the first packet.
 		public ValueTask<PayloadData> ReceiveAsync(IOBehavior ioBehavior, CancellationToken cancellationToken)
 		{
-			m_payloadHandler.StartNewConversation();
+			m_payloadHandler!.StartNewConversation();
 			return ReceiveReplyAsync(ioBehavior, cancellationToken);
 		}
 
@@ -642,7 +731,7 @@ namespace MySqlConnector.Core
 			try
 			{
 				VerifyConnected();
-				task = m_payloadHandler.ReadPayloadAsync(m_payloadCache, ProtocolErrorBehavior.Throw, ioBehavior);
+				task = m_payloadHandler!.ReadPayloadAsync(m_payloadCache, ProtocolErrorBehavior.Throw, ioBehavior);
 			}
 			catch (Exception ex)
 			{
@@ -658,11 +747,31 @@ namespace MySqlConnector.Core
 				if (payload.HeaderByte != ErrorPayload.Signature)
 					return new ValueTask<PayloadData>(payload);
 
-				var exception = CreateExceptionForErrorPayload(payload);
+				var exception = CreateExceptionForErrorPayload(payload.Span);
 				return ValueTaskExtensions.FromException<PayloadData>(exception);
 			}
 
-			return new ValueTask<PayloadData>(task.AsTask().ContinueWith(TryAsyncContinuation, cancellationToken, TaskContinuationOptions.LazyCancellation | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default));
+			return ReceiveReplyAsyncAwaited(task);
+		}
+
+		private async ValueTask<PayloadData> ReceiveReplyAsyncAwaited(ValueTask<ArraySegment<byte>> task)
+		{
+			ArraySegment<byte> bytes;
+			try
+			{
+				bytes = await task.ConfigureAwait(false);
+			}
+			catch (Exception ex)
+			{
+				SetFailed(ex);
+				if (ex is MySqlException msex && msex.Number == (int) MySqlErrorCode.CommandTimeoutExpired)
+					HandleTimeout();
+				throw;
+			}
+			var payload = new PayloadData(bytes);
+			if (payload.HeaderByte == ErrorPayload.Signature)
+				throw CreateExceptionForErrorPayload(payload.Span);
+			return payload;
 		}
 
 		// Continues a conversation with the server by sending a reply to a packet received with 'Receive' or 'ReceiveReply'.
@@ -672,7 +781,7 @@ namespace MySqlConnector.Core
 			try
 			{
 				VerifyConnected();
-				task = m_payloadHandler.WritePayloadAsync(payload.ArraySegment, ioBehavior);
+				task = m_payloadHandler!.WritePayloadAsync(payload.Memory, ioBehavior);
 			}
 			catch (Exception ex)
 			{
@@ -683,12 +792,25 @@ namespace MySqlConnector.Core
 			if (task.IsCompletedSuccessfully)
 				return task;
 
-			return new ValueTask<int>(task.AsTask().ContinueWith(TryAsyncContinuation, cancellationToken, TaskContinuationOptions.LazyCancellation | TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default));
+			return SendReplyAsyncAwaited(task);
+		}
+
+		private async ValueTask<int> SendReplyAsyncAwaited(ValueTask<int> task)
+		{
+			try
+			{
+				return await task.ConfigureAwait(false);
+			}
+			catch (Exception ex)
+			{
+				SetFailed(ex);
+				throw;
+			}
 		}
 
 		internal void HandleTimeout()
 		{
-			if (OwningConnection != null && OwningConnection.TryGetTarget(out var connection))
+			if (OwningConnection is object && OwningConnection.TryGetTarget(out var connection))
 				connection.SetState(ConnectionState.Closed);
 		}
 
@@ -705,7 +827,7 @@ namespace MySqlConnector.Core
 
 		private async Task<bool> OpenTcpSocketAsync(ConnectionSettings cs, ILoadBalancer loadBalancer, IOBehavior ioBehavior, CancellationToken cancellationToken)
 		{
-			var hostNames = loadBalancer.LoadBalance(cs.HostNames);
+			var hostNames = loadBalancer.LoadBalance(cs.HostNames!);
 			foreach (var hostName in hostNames)
 			{
 				IPAddress[] ipAddresses;
@@ -735,7 +857,7 @@ namespace MySqlConnector.Core
 				foreach (var ipAddress in ipAddresses)
 				{
 					Log.Info("Session{0} connecting to IpAddress {1} for HostName '{2}'", m_logArguments[0], ipAddress, hostName);
-					TcpClient tcpClient = null;
+					TcpClient? tcpClient = null;
 					try
 					{
 						tcpClient = new TcpClient(ipAddress.AddressFamily);
@@ -775,7 +897,7 @@ namespace MySqlConnector.Core
 							{
 								SafeDispose(ref tcpClient);
 								Log.Info("Session{0} connect timeout expired connecting to IpAddress {1} for HostName '{2}'", m_logArguments[0], ipAddress, hostName);
-								throw new MySqlException("Connect Timeout expired.", ex);
+								throw new MySqlException(MySqlErrorCode.UnableToConnectToHost, "Connect Timeout expired.", ex);
 							}
 						}
 					}
@@ -789,7 +911,7 @@ namespace MySqlConnector.Core
 					{
 						SafeDispose(ref tcpClient);
 						Log.Info("Session{0} connect timeout expired connecting to IpAddress {1} for HostName '{2}'", m_logArguments[0], ipAddress, hostName);
-						throw new MySqlException("Connect Timeout expired.");
+						throw new MySqlException(MySqlErrorCode.UnableToConnectToHost, "Connect Timeout expired.");
 					}
 
 					HostName = hostName;
@@ -811,7 +933,7 @@ namespace MySqlConnector.Core
 			m_logArguments[1] = cs.UnixSocket;
 			Log.Info("Session{0} connecting to UNIX Socket '{1}'", m_logArguments);
 			var socket = new Socket(AddressFamily.Unix, SocketType.Stream, ProtocolType.IP);
-			var unixEp = new UnixEndPoint(cs.UnixSocket);
+			var unixEp = new UnixEndPoint(cs.UnixSocket!);
 			try
 			{
 				using (cancellationToken.Register(() => socket.Dispose()))
@@ -834,7 +956,7 @@ namespace MySqlConnector.Core
 					catch (ObjectDisposedException ex) when (cancellationToken.IsCancellationRequested)
 					{
 						Log.Info("Session{0} connect timeout expired connecting to UNIX Socket '{1}'", m_logArguments);
-						throw new MySqlException("Connect Timeout expired.", ex);
+						throw new MySqlException(MySqlErrorCode.UnableToConnectToHost, "Connect Timeout expired.", ex);
 					}
 				}
 			}
@@ -862,8 +984,8 @@ namespace MySqlConnector.Core
 			throw new NotSupportedException("Named pipe connections are not supported in netstandard1.3");
 #else
 			if (Log.IsInfoEnabled())
-				Log.Info("Session{0} connecting to NamedPipe '{1}' on Server '{2}'", m_logArguments[0], cs.PipeName, cs.HostNames[0]);
-			var namedPipeStream = new NamedPipeClientStream(cs.HostNames[0], cs.PipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
+				Log.Info("Session{0} connecting to NamedPipe '{1}' on Server '{2}'", m_logArguments[0], cs.PipeName, cs.HostNames![0]);
+			var namedPipeStream = new NamedPipeClientStream(cs.HostNames![0], cs.PipeName, PipeDirection.InOut, PipeOptions.Asynchronous);
 			try
 			{
 				using (cancellationToken.Register(() => namedPipeStream.Dispose()))
@@ -876,7 +998,7 @@ namespace MySqlConnector.Core
 					{
 						m_logArguments[1] = cs.PipeName;
 						Log.Info("Session{0} connect timeout expired connecting to named pipe '{1}'", m_logArguments);
-						throw new MySqlException("Connect Timeout expired.", ex);
+						throw new MySqlException(MySqlErrorCode.UnableToConnectToHost, "Connect Timeout expired.", ex);
 					}
 				}
 			}
@@ -901,7 +1023,7 @@ namespace MySqlConnector.Core
 		private async Task InitSslAsync(ProtocolCapabilities serverCapabilities, ConnectionSettings cs, SslProtocols sslProtocols, IOBehavior ioBehavior, CancellationToken cancellationToken)
 		{
 			Log.Info("Session{0} initializing TLS connection", m_logArguments);
-			X509CertificateCollection clientCertificates = null;
+			X509CertificateCollection? clientCertificates = null;
 
 			if (cs.CertificateStoreLocation != MySqlCertificateStoreLocation.None)
 			{
@@ -911,7 +1033,7 @@ namespace MySqlConnector.Core
 					var store = new X509Store(StoreName.My, storeLocation);
 					store.Open(OpenFlags.ReadOnly | OpenFlags.OpenExistingOnly);
 
-					if (cs.CertificateThumbprint == null)
+					if (cs.CertificateThumbprint is null)
 					{
 						if (store.Certificates.Count == 0)
 						{
@@ -943,11 +1065,85 @@ namespace MySqlConnector.Core
 				}
 			}
 
-			if (cs.CertificateFile != null)
+			if (cs.SslCertificateFile is object && cs.SslKeyFile is object)
+			{
+#if !NETSTANDARD1_3 && !NETSTANDARD2_0
+				m_logArguments[1] = cs.SslKeyFile;
+				Log.Debug("Session{0} loading client key from KeyFile '{1}'", m_logArguments);
+				string keyPem;
+				try
+				{
+					keyPem = File.ReadAllText(cs.SslKeyFile);
+				}
+				catch (Exception ex)
+				{
+					Log.Error(ex, "Session{0} couldn't load client key from KeyFile '{1}'", m_logArguments);
+					throw new MySqlException("Could not load client key file: " + cs.SslKeyFile, ex);
+				}
+
+				RSAParameters rsaParameters;
+				try
+				{
+					rsaParameters = Utility.GetRsaParameters(keyPem);
+				}
+				catch (FormatException ex)
+				{
+					Log.Error(ex, "Session{0} couldn't load client key from KeyFile '{1}'", m_logArguments);
+					throw new MySqlException("Could not load the client key from " + cs.SslKeyFile, ex);
+				}
+
+				try
+				{
+					RSA rsa;
+					try
+					{
+						// SslStream on Windows needs a KeyContainerName to be set
+						var csp = new CspParameters
+						{
+							KeyContainerName = new Guid().ToString(),
+						};
+						rsa = new RSACryptoServiceProvider(csp)
+						{
+							PersistKeyInCsp = true,
+						};
+					}
+					catch (PlatformNotSupportedException)
+					{
+						rsa = RSA.Create();
+					}
+					rsa.ImportParameters(rsaParameters);
+
+#if NET45 || NET461 || NET471
+					var certificate = new X509Certificate2(cs.SslCertificateFile, "", X509KeyStorageFlags.MachineKeySet)
+					{
+						PrivateKey = rsa,
+					};
+#else
+					X509Certificate2 certificate;
+					using (var publicCertificate = new X509Certificate2(cs.SslCertificateFile))
+						certificate = publicCertificate.CopyWithPrivateKey(rsa);
+#endif
+
+					m_clientCertificate = certificate;
+					clientCertificates = new X509CertificateCollection { certificate };
+				}
+
+				catch (CryptographicException ex)
+				{
+					Log.Error(ex, "Session{0} couldn't load client key from KeyFile '{1}'", m_logArguments);
+					if (!File.Exists(cs.SslCertificateFile))
+						throw new MySqlException("Cannot find client certificate file: " + cs.SslCertificateFile, ex);
+					throw new MySqlException("Could not load the client key from " + cs.SslKeyFile, ex);
+				}
+#else
+				throw new NotSupportedException("SslCert and SslKey connection string options are not supported in netstandard1.3 or netstandard2.0.");
+#endif
+			}
+			else if (cs.CertificateFile is object)
 			{
 				try
 				{
-					var certificate = new X509Certificate2(cs.CertificateFile, cs.CertificatePassword);
+					var certificate = new X509Certificate2(cs.CertificateFile, cs.CertificatePassword, X509KeyStorageFlags.MachineKeySet);
 					if (!certificate.HasPrivateKey)
 					{
 						m_logArguments[1] = cs.CertificateFile;
@@ -968,10 +1164,10 @@ namespace MySqlConnector.Core
 				}
 			}
 
-			X509Chain caCertificateChain = null;
-			if (cs.CACertificateFile != null)
+			X509Chain? caCertificateChain = null;
+			if (cs.CACertificateFile is object)
 			{
-				var certificateChain = new X509Chain
+				X509Chain? certificateChain = new X509Chain
 				{
 					ChainPolicy =
 						{
@@ -999,13 +1195,13 @@ namespace MySqlConnector.Core
 					// find the index of each individual certificate in the file (assuming there may be multiple certificates concatenated together)
 					for (var index = 0; index != -1;)
 					{
-						var nextIndex = Utility.FindNextIndex(certificateBytes, index + 1, s_beginCertificateBytes);
+						var nextIndex = Utility.FindNextIndex(certificateBytes, index + 1, BeginCertificateBytes);
 						try
 						{
 							// load the certificate at this index; note that 'new X509Certificate' stops at the end of the first certificate it loads
 							m_logArguments[1] = index;
 							Log.Debug("Session{0} loading certificate at Index {1} in the CA certificate file.", m_logArguments);
-							var caCertificate = new X509Certificate2(Utility.ArraySlice(certificateBytes, index, (nextIndex == -1 ? certificateBytes.Length : nextIndex) - index));
+							var caCertificate = new X509Certificate2(Utility.ArraySlice(certificateBytes, index, (nextIndex == -1 ? certificateBytes.Length : nextIndex) - index), default(string), X509KeyStorageFlags.MachineKeySet);
 							certificateChain.ChainPolicy.ExtraStore.Add(caCertificate);
 						}
 						catch (CryptographicException ex)
@@ -1041,7 +1237,7 @@ namespace MySqlConnector.Core
 				if (cs.SslMode == MySqlSslMode.Preferred || cs.SslMode == MySqlSslMode.Required)
 					return true;
 
-				if ((rcbPolicyErrors & SslPolicyErrors.RemoteCertificateChainErrors) != 0 && caCertificateChain != null)
+				if ((rcbPolicyErrors & SslPolicyErrors.RemoteCertificateChainErrors) != 0 && caCertificateChain is object)
 				{
 					if (caCertificateChain.Build((X509Certificate2) rcbCertificate) && caCertificateChain.ChainStatus.Length > 0)
 					{
@@ -1057,15 +1253,12 @@ namespace MySqlConnector.Core
 				return rcbPolicyErrors == SslPolicyErrors.None;
 			}
 
-			SslStream sslStream;
-			if (clientCertificates == null)
-				sslStream = new SslStream(m_stream, false, ValidateRemoteCertificate);
-			else
-				sslStream = new SslStream(m_stream, false, ValidateRemoteCertificate, ValidateLocalCertificate);
+			var sslStream = clientCertificates is null ? new SslStream(m_stream, false, ValidateRemoteCertificate) :
+				new SslStream(m_stream, false, ValidateRemoteCertificate, ValidateLocalCertificate);
 
 			var checkCertificateRevocation = cs.SslMode == MySqlSslMode.VerifyFull;
 
-			using (var initSsl = HandshakeResponse41Payload.CreateWithSsl(serverCapabilities, cs, m_useCompression))
+			using (var initSsl = HandshakeResponse41Payload.CreateWithSsl(serverCapabilities, cs, m_useCompression, m_characterSet))
 				await SendReplyAsync(initSsl, ioBehavior, cancellationToken).ConfigureAwait(false);
 
 			try
@@ -1083,7 +1276,7 @@ namespace MySqlConnector.Core
 #endif
 				}
 				var sslByteHandler = new StreamByteHandler(sslStream);
-				m_payloadHandler.ByteHandler = sslByteHandler;
+				m_payloadHandler!.ByteHandler = sslByteHandler;
 				m_isSecureConnection = true;
 				m_sslStream = sslStream;
 				m_logArguments[1] = sslStream.SslProtocol;
@@ -1098,9 +1291,9 @@ namespace MySqlConnector.Core
 				lock (m_lock)
 					m_state = State.Failed;
 				if (ex is AuthenticationException)
-					throw new MySqlException("SSL Authentication Error", ex);
-				if (ex is IOException && clientCertificates != null)
-					throw new MySqlException("MySQL Server rejected client certificate", ex);
+					throw new MySqlException(MySqlErrorCode.UnableToConnectToHost, "SSL Authentication Error", ex);
+				if (ex is IOException && clientCertificates is object)
+					throw new MySqlException(MySqlErrorCode.UnableToConnectToHost, "MySQL Server rejected client certificate", ex);
 				throw;
 			}
 			finally
@@ -1116,10 +1309,20 @@ namespace MySqlConnector.Core
 		// Some servers are exposed through a proxy, which handles the initial handshake and gives the proxy's
 		// server version and thread ID. Detect this situation and return `true` if the real server's details should
 		// be requested after connecting (which takes an extra roundtrip).
-		private bool ShouldGetRealServerDetails()
+		private bool ShouldGetRealServerDetails(ConnectionSettings cs)
 		{
-			// currently hardcoded to the version returned by the Azure Database for MySQL proxy
-			return ServerVersion.OriginalString == "5.6.26.0";
+			// currently hardcoded to the version(s) returned by the Azure Database for MySQL proxy
+			if (ServerVersion.OriginalString == "5.6.42.0" || ServerVersion.OriginalString == "5.6.39.0" || ServerVersion.OriginalString == "5.6.26.0")
+				return true;
+
+			// detect Azure Database for MySQL DNS suffixes
+			if (cs.ConnectionProtocol == MySqlConnectionProtocol.Sockets && cs.HostNames!.Count == 1)
+			{
+				return cs.HostNames[0].EndsWith(".mysql.database.azure.com", StringComparison.OrdinalIgnoreCase) ||
+					cs.HostNames[0].EndsWith(".mysql.database.chinacloudapi.cn", StringComparison.OrdinalIgnoreCase);
+			}
+
+			return false;
 		}
 
 		private async Task GetRealServerDetailsAsync(IOBehavior ioBehavior, CancellationToken cancellationToken)
@@ -1140,33 +1343,34 @@ namespace MySqlConnector.Core
 				if (!SupportsDeprecateEof)
 				{
 					payload = await ReceiveReplyAsync(ioBehavior, CancellationToken.None).ConfigureAwait(false);
-					EofPayload.Create(payload);
+					EofPayload.Create(payload.Span);
 				}
 
 				// first (and only) row
 				payload = await ReceiveReplyAsync(ioBehavior, CancellationToken.None).ConfigureAwait(false);
-				void ReadRow(ArraySegment<byte> arraySegment, out int? connectionId_, out string serverVersion_)
+				static void ReadRow(ReadOnlySpan<byte> span, out int? connectionId_, out byte[]? serverVersion_)
 				{
-					var reader = new ByteArrayReader(arraySegment);
+					var reader = new ByteArrayReader(span);
 					var length = reader.ReadLengthEncodedIntegerOrNull();
 					connectionId_ = (length != -1 && Utf8Parser.TryParse(reader.ReadByteString(length), out int id, out _)) ? id : default(int?);
 					length = reader.ReadLengthEncodedIntegerOrNull();
-					serverVersion_ = length != -1 ? Encoding.UTF8.GetString(reader.ReadByteString(length)) : null;
+					serverVersion_ = length != -1 ? reader.ReadByteString(length).ToArray() : null;
 				}
-				ReadRow(payload.ArraySegment, out var connectionId, out var serverVersion);
+				ReadRow(payload.Span, out var connectionId, out var serverVersion);
 
 				// OK/EOF payload
 				payload = await ReceiveReplyAsync(ioBehavior, CancellationToken.None).ConfigureAwait(false);
-				if (OkPayload.IsOk(payload, SupportsDeprecateEof))
-					OkPayload.Create(payload, SupportsDeprecateEof);
+				if (OkPayload.IsOk(payload.Span, SupportsDeprecateEof))
+					OkPayload.Create(payload.Span, SupportsDeprecateEof, SupportsSessionTrack);
 				else
-					EofPayload.Create(payload);
+					EofPayload.Create(payload.Span);
 
-				if (connectionId.HasValue && serverVersion != null)
+				if (connectionId.HasValue && serverVersion is object)
 				{
-					Log.Info("Session{0} changing ConnectionIdOld {1} to ConnectionId {2} and ServerVersionOld {3} to ServerVersion {4}", m_logArguments[0], ConnectionId, connectionId.Value, ServerVersion.OriginalString, serverVersion);
+					var newServerVersion = new ServerVersion(serverVersion);
+					Log.Info("Session{0} changing ConnectionIdOld {1} to ConnectionId {2} and ServerVersionOld {3} to ServerVersion {4}", m_logArguments[0], ConnectionId, connectionId.Value, ServerVersion.OriginalString, newServerVersion.OriginalString);
 					ConnectionId = connectionId.Value;
-					ServerVersion = new ServerVersion(serverVersion);
+					ServerVersion = newServerVersion;
 				}
 			}
 			catch (MySqlException ex)
@@ -1196,10 +1400,10 @@ namespace MySqlConnector.Core
 		/// </summary>
 		/// <typeparam name="T">An <see cref="IDisposable"/> type.</typeparam>
 		/// <param name="disposable">The object to dispose.</param>
-		private static void SafeDispose<T>(ref T disposable)
+		private static void SafeDispose<T>(ref T? disposable)
 			where T : class, IDisposable
 		{
-			if (disposable != null)
+			if (disposable is object)
 			{
 				try
 				{
@@ -1215,43 +1419,13 @@ namespace MySqlConnector.Core
 			}
 		}
 
-		private int TryAsyncContinuation(Task<int> task)
-		{
-			if (task.IsFaulted)
-			{
-				SetFailed(task.Exception.InnerException);
-				task.GetAwaiter().GetResult();
-			}
-			return 0;
-		}
-
-		private PayloadData TryAsyncContinuation(Task<ArraySegment<byte>> task)
-		{
-			if (task.IsFaulted)
-				SetFailed(task.Exception.InnerException);
-			ArraySegment<byte> bytes;
-			try
-			{
-				bytes = task.GetAwaiter().GetResult();
-			}
-			catch (MySqlException ex) when (ex.Number == (int) MySqlErrorCode.CommandTimeoutExpired)
-			{
-				HandleTimeout();
-				throw;
-			}
-			var payload = new PayloadData(bytes);
-			if (payload.HeaderByte == ErrorPayload.Signature)
-				throw CreateExceptionForErrorPayload(payload);
-			return payload;
-		}
-
 		internal void SetFailed(Exception exception)
 		{
 			m_logArguments[1] = exception.Message;
 			Log.Info(exception, "Session{0} setting state to Failed", m_logArguments);
 			lock (m_lock)
 				m_state = State.Failed;
-			if (OwningConnection != null && OwningConnection.TryGetTarget(out var connection))
+			if (OwningConnection is object && OwningConnection.TryGetTarget(out var connection))
 				connection.SetState(ConnectionState.Closed);
 		}
 
@@ -1292,18 +1466,18 @@ namespace MySqlConnector.Core
 
 		internal SslProtocols SslProtocol => m_sslStream?.SslProtocol ?? SslProtocols.None;
 
-		private byte[] CreateConnectionAttributes(string programName)
+		private byte[] CreateConnectionAttributes(string? programName)
 		{
 			Log.Debug("Session{0} creating connection attributes", m_logArguments);
 			var attributesWriter = new ByteBufferWriter();
 			attributesWriter.WriteLengthEncodedString("_client_name");
 			attributesWriter.WriteLengthEncodedString("MySqlConnector");
 			attributesWriter.WriteLengthEncodedString("_client_version");
-			attributesWriter.WriteLengthEncodedString(typeof(ServerSession).GetTypeInfo().Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>().InformationalVersion);
+			attributesWriter.WriteLengthEncodedString(typeof(ServerSession).GetTypeInfo().Assembly.GetCustomAttribute<AssemblyInformationalVersionAttribute>()!.InformationalVersion);
 			try
 			{
 				Utility.GetOSDetails(out var os, out var osDescription, out var architecture);
-				if (os != null)
+				if (os is object)
 				{
 					attributesWriter.WriteLengthEncodedString("_os");
 					attributesWriter.WriteLengthEncodedString(os);
@@ -1316,38 +1490,34 @@ namespace MySqlConnector.Core
 			catch (PlatformNotSupportedException)
 			{
 			}
-			using (var process = Process.GetCurrentProcess())
-			{
-				attributesWriter.WriteLengthEncodedString("_pid");
-				attributesWriter.WriteLengthEncodedString(process.Id.ToString(CultureInfo.InvariantCulture));
-			}
+			using var process = Process.GetCurrentProcess();
+			attributesWriter.WriteLengthEncodedString("_pid");
+			attributesWriter.WriteLengthEncodedString(process.Id.ToString(CultureInfo.InvariantCulture));
 			if (!string.IsNullOrEmpty(programName))
 			{
 				attributesWriter.WriteLengthEncodedString("program_name");
-				attributesWriter.WriteLengthEncodedString(programName);
+				attributesWriter.WriteLengthEncodedString(programName!);
 			}
-			using (var connectionAttributesPayload = attributesWriter.ToPayloadData())
-			{
-				var connectionAttributes = connectionAttributesPayload.ArraySegment;
-				var writer = new ByteBufferWriter(connectionAttributes.Count + 9);
-				writer.WriteLengthEncodedInteger((ulong) connectionAttributes.Count);
-				writer.Write(connectionAttributes);
-				using (var payload = writer.ToPayloadData())
-					return payload.ArraySegment.AsSpan().ToArray();
-			}
+			using var connectionAttributesPayload = attributesWriter.ToPayloadData();
+			var connectionAttributes = connectionAttributesPayload.Span;
+			var writer = new ByteBufferWriter(connectionAttributes.Length + 9);
+			writer.WriteLengthEncodedInteger((ulong) connectionAttributes.Length);
+			writer.Write(connectionAttributes);
+			using var payload = writer.ToPayloadData();
+			return payload.Memory.ToArray();
 		}
 
-		private Exception CreateExceptionForErrorPayload(PayloadData payload)
+		private Exception CreateExceptionForErrorPayload(ReadOnlySpan<byte> span)
 		{
-			var errorPayload = ErrorPayload.Create(payload);
-			var exception = errorPayload.ToException();
-			Log.Error(exception, "Session{0} got error payload: Code={1}, State={2}, Message={3}", m_logArguments[0], errorPayload.ErrorCode, errorPayload.State, errorPayload.Message);
-			return exception;
+			var errorPayload = ErrorPayload.Create(span);
+			if (Log.IsDebugEnabled())
+				Log.Debug("Session{0} got error payload: Code={1}, State={2}, Message={3}", m_logArguments[0], errorPayload.ErrorCode, errorPayload.State, errorPayload.Message);
+			return errorPayload.ToException();
 		}
 
 		private void ClearPreparedStatements()
 		{
-			if (m_preparedStatements != null)
+			if (m_preparedStatements is object)
 			{
 				foreach (var pair in m_preparedStatements)
 					pair.Value.Dispose();
@@ -1385,26 +1555,31 @@ namespace MySqlConnector.Core
 			Failed,
 		}
 
-		static readonly byte[] s_beginCertificateBytes = new byte[] { 45, 45, 45, 45, 45, 66, 69, 71, 73, 78, 32, 67, 69, 82, 84, 73, 70, 73, 67, 65, 84, 69, 45, 45, 45, 45, 45 }; // -----BEGIN CERTIFICATE-----
+		static ReadOnlySpan<byte> BeginCertificateBytes => new byte[] { 45, 45, 45, 45, 45, 66, 69, 71, 73, 78, 32, 67, 69, 82, 84, 73, 70, 73, 67, 65, 84, 69, 45, 45, 45, 45, 45 }; // -----BEGIN CERTIFICATE-----
 		static int s_lastId;
 		static readonly IMySqlConnectorLogger Log = MySqlConnectorLogManager.CreateLogger(nameof(ServerSession));
-		static readonly PayloadData s_setNamesUtf8mb4Payload = QueryPayload.Create("SET NAMES utf8mb4 COLLATE utf8mb4_bin;");
+		static readonly PayloadData s_setNamesUtf8Payload = QueryPayload.Create("SET NAMES utf8;");
+		static readonly PayloadData s_setNamesUtf8mb4Payload = QueryPayload.Create("SET NAMES utf8mb4;");
 
 		readonly object m_lock;
-		readonly object[] m_logArguments;
+		readonly object?[] m_logArguments;
 		readonly ArraySegmentHolder<byte> m_payloadCache;
 		State m_state;
-		TcpClient m_tcpClient;
-		Socket m_socket;
-		Stream m_stream;
-		SslStream m_sslStream;
-		X509Certificate2 m_clientCertificate;
-		IPayloadHandler m_payloadHandler;
+		TcpClient? m_tcpClient;
+		Socket? m_socket;
+		Stream? m_stream;
+		SslStream? m_sslStream;
+		X509Certificate2? m_clientCertificate;
+		IPayloadHandler? m_payloadHandler;
 		int m_activeCommandId;
 		bool m_useCompression;
 		bool m_isSecureConnection;
+		bool m_supportsComMulti;
 		bool m_supportsConnectionAttributes;
 		bool m_supportsDeprecateEof;
-		Dictionary<string, PreparedStatements> m_preparedStatements;
+		bool m_supportsSessionTrack;
+		CharacterSet m_characterSet;
+		PayloadData m_setNamesPayload;
+		Dictionary<string, PreparedStatements>? m_preparedStatements;
 	}
 }

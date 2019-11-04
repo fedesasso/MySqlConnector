@@ -13,14 +13,9 @@ namespace MySqlConnector.Protocol.Serialization
 			m_maxOffset = buffer.Length;
 		}
 
-		public ByteArrayReader(ArraySegment<byte> arraySegment)
-			: this(arraySegment.AsSpan())
-		{
-		}
-
 		public int Offset
 		{
-			get => m_offset;
+			readonly get => m_offset;
 			set => m_offset = value >= 0 && value <= m_maxOffset ? value : throw new ArgumentOutOfRangeException(nameof(value), "value must be between 0 and {0}".FormatInvariant(m_maxOffset));
 		}
 
@@ -126,22 +121,16 @@ namespace MySqlConnector.Protocol.Serialization
 
 		public ulong ReadLengthEncodedInteger()
 		{
-			byte encodedLength = m_buffer[m_offset++];
-			switch (encodedLength)
+			var encodedLength = m_buffer[m_offset++];
+			return encodedLength switch
 			{
-			case 0xFB:
-				throw new FormatException("Length-encoded integer cannot have 0xFB prefix byte.");
-			case 0xFC:
-				return ReadFixedLengthUInt32(2);
-			case 0xFD:
-				return ReadFixedLengthUInt32(3);
-			case 0xFE:
-				return ReadFixedLengthUInt64(8);
-			case 0xFF:
-				throw new FormatException("Length-encoded integer cannot have 0xFF prefix byte.");
-			default:
-				return encodedLength;
-			}
+				0xFB => throw new FormatException("Length-encoded integer cannot have 0xFB prefix byte."),
+				0xFC => ReadFixedLengthUInt32(2),
+				0xFD => ReadFixedLengthUInt32(3),
+				0xFE => ReadFixedLengthUInt64(8),
+				0xFF => throw new FormatException("Length-encoded integer cannot have 0xFF prefix byte."),
+				_ => encodedLength
+			};
 		}
 
 		public int ReadLengthEncodedIntegerOrNull()
@@ -163,9 +152,9 @@ namespace MySqlConnector.Protocol.Serialization
 			return result;
 		}
 
-		public int BytesRemaining => m_maxOffset - m_offset;
+		public readonly int BytesRemaining => m_maxOffset - m_offset;
 
-		private void VerifyRead(int length)
+		private readonly void VerifyRead(int length)
 		{
 			if (m_offset + length > m_maxOffset)
 				throw new InvalidOperationException("Read past end of buffer.");

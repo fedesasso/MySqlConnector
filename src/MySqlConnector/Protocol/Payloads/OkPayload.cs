@@ -11,25 +11,23 @@ namespace MySqlConnector.Protocol.Payloads
 		public ulong LastInsertId { get; }
 		public ServerStatus ServerStatus { get; }
 		public int WarningCount { get; }
-		public string NewSchema { get; }
+		public string? NewSchema { get; }
 
 		public const byte Signature = 0x00;
 
 		/* See
-		 * http://web.archive.org/web/20160604101747/http://dev.mysql.com/doc/internals/en/packet-OK_Packet.html
+		 * https://dev.mysql.com/doc/internals/en/packet-OK_Packet.html
 		 * https://mariadb.com/kb/en/the-mariadb-library/resultset/
 		 * https://github.com/MariaDB/mariadb-connector-j/blob/5fa814ac6e1b4c9cb6d141bd221cbd5fc45c8a78/src/main/java/org/mariadb/jdbc/internal/com/read/resultset/SelectResultSet.java#L443-L444
 		 */
-		public static bool IsOk(PayloadData payload, bool deprecateEof) =>
-			payload.ArraySegment.Array != null && payload.ArraySegment.Count > 0 &&
-				((payload.ArraySegment.Count > 6 && payload.ArraySegment.Array[payload.ArraySegment.Offset] == Signature) ||
-				(deprecateEof && payload.ArraySegment.Count < 0xFF_FFFF && payload.ArraySegment.Array[payload.ArraySegment.Offset] == EofPayload.Signature));
+		public static bool IsOk(ReadOnlySpan<byte> span, bool deprecateEof) =>
+			span.Length > 0 &&
+				(span.Length > 6 && span[0] == Signature ||
+				 deprecateEof && span.Length < 0xFF_FFFF && span[0] == EofPayload.Signature);
 
-		public static OkPayload Create(PayloadData payload) => Create(payload, false);
-
-		public static OkPayload Create(PayloadData payload, bool deprecateEof)
+		public static OkPayload Create(ReadOnlySpan<byte> span, bool deprecateEof, bool clientSessionTrack)
 		{
-			var reader = new ByteArrayReader(payload.ArraySegment);
+			var reader = new ByteArrayReader(span);
 			var signature = reader.ReadByte();
 			if (signature != Signature && (!deprecateEof || signature != EofPayload.Signature))
 				throw new FormatException("Expected to read 0x00 or 0xFE but got 0x{0:X2}".FormatInvariant(signature));
@@ -37,9 +35,9 @@ namespace MySqlConnector.Protocol.Payloads
 			var lastInsertId = reader.ReadLengthEncodedInteger();
 			var serverStatus = (ServerStatus) reader.ReadUInt16();
 			var warningCount = (int) reader.ReadUInt16();
-			string newSchema = null;
+			string? newSchema = null;
 
-			if ((serverStatus & ServerStatus.SessionStateChanged) == ServerStatus.SessionStateChanged)
+			if (clientSessionTrack && (serverStatus & ServerStatus.SessionStateChanged) == ServerStatus.SessionStateChanged)
 			{
 				reader.ReadLengthEncodedByteString(); // human-readable info
 
@@ -68,7 +66,7 @@ namespace MySqlConnector.Protocol.Payloads
 				// ignore human-readable string in both cases
 			}
 
-			if (affectedRowCount == 0 && lastInsertId == 0 && warningCount == 0 && newSchema == null)
+			if (affectedRowCount == 0 && lastInsertId == 0 && warningCount == 0 && newSchema is null)
 			{
 				if (serverStatus == ServerStatus.AutoCommit)
 					return s_autoCommitOk;
@@ -79,7 +77,7 @@ namespace MySqlConnector.Protocol.Payloads
 			return new OkPayload(affectedRowCount, lastInsertId, serverStatus, warningCount, newSchema);
 		}
 
-		private OkPayload(int affectedRowCount, ulong lastInsertId, ServerStatus serverStatus, int warningCount, string newSchema)
+		private OkPayload(int affectedRowCount, ulong lastInsertId, ServerStatus serverStatus, int warningCount, string? newSchema)
 		{
 			AffectedRowCount = affectedRowCount;
 			LastInsertId = lastInsertId;

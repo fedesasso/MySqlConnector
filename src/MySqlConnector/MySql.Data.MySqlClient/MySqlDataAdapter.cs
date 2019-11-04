@@ -28,31 +28,31 @@ namespace MySql.Data.MySqlClient
 		{
 		}
 
-		public event MySqlRowUpdatingEventHandler RowUpdating;
+		public event MySqlRowUpdatingEventHandler? RowUpdating;
 
-		public event MySqlRowUpdatedEventHandler RowUpdated;
+		public event MySqlRowUpdatedEventHandler? RowUpdated;
 
-		public new MySqlCommand DeleteCommand
+		public new MySqlCommand? DeleteCommand
 		{
-			get => (MySqlCommand) base.DeleteCommand;
+			get => (MySqlCommand?) base.DeleteCommand;
 			set => base.DeleteCommand = value;
 		}
 
-		public new MySqlCommand InsertCommand
+		public new MySqlCommand? InsertCommand
 		{
-			get => (MySqlCommand) base.InsertCommand;
+			get => (MySqlCommand?) base.InsertCommand;
 			set => base.InsertCommand = value;
 		}
 
-		public new MySqlCommand SelectCommand
+		public new MySqlCommand? SelectCommand
 		{
-			get => (MySqlCommand) base.SelectCommand;
+			get => (MySqlCommand?) base.SelectCommand;
 			set => base.SelectCommand = value;
 		}
 
-		public new MySqlCommand UpdateCommand
+		public new MySqlCommand? UpdateCommand
 		{
-			get => (MySqlCommand) base.UpdateCommand;
+			get => (MySqlCommand?) base.UpdateCommand;
 			set => base.UpdateCommand = value;
 		}
 
@@ -63,6 +63,47 @@ namespace MySql.Data.MySqlClient
 		protected override RowUpdatingEventArgs CreateRowUpdatingEvent(DataRow dataRow, IDbCommand command, StatementType statementType, DataTableMapping tableMapping) => new MySqlRowUpdatingEventArgs(dataRow, command, statementType, tableMapping);
 
 		protected override RowUpdatedEventArgs CreateRowUpdatedEvent(DataRow dataRow, IDbCommand command, StatementType statementType, DataTableMapping tableMapping) => new MySqlRowUpdatedEventArgs(dataRow, command, statementType, tableMapping);
+
+		public override int UpdateBatchSize { get; set; }
+
+		protected override void InitializeBatching() => m_batch = new MySqlBatch();
+
+		protected override void TerminateBatching()
+		{
+			m_batch?.Dispose();
+			m_batch = null;
+		}
+
+		protected override int AddToBatch(IDbCommand command)
+		{
+			var mySqlCommand = (MySqlCommand) command;
+			if (m_batch!.Connection is null)
+			{
+				m_batch.Connection = mySqlCommand.Connection;
+				m_batch.Transaction = mySqlCommand.Transaction;
+			}
+
+			var count = m_batch.BatchCommands.Count;
+			var batchCommand = new MySqlBatchCommand
+			{
+				CommandText = command.CommandText,
+				CommandType = command.CommandType,
+			};
+			if (mySqlCommand.CloneRawParameters() is MySqlParameterCollection clonedParameters)
+			{
+				foreach (var clonedParameter in clonedParameters)
+					batchCommand.Parameters.Add(clonedParameter);
+			}
+
+			m_batch.BatchCommands.Add(batchCommand);
+			return count;
+		}
+
+		protected override void ClearBatch() => m_batch!.BatchCommands.Clear();
+
+		protected override int ExecuteBatch() => m_batch!.ExecuteNonQuery();
+
+		MySqlBatch? m_batch;
 	}
 
 	public delegate void MySqlRowUpdatingEventHandler(object sender, MySqlRowUpdatingEventArgs e);

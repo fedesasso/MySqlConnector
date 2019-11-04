@@ -11,27 +11,35 @@ namespace MySqlConnector.Protocol.Payloads
 		public byte[] ServerVersion { get; }
 		public int ConnectionId { get; }
 		public byte[] AuthPluginData { get; }
-		public string AuthPluginName { get; }
+		public string? AuthPluginName { get; }
 
-		public static InitialHandshakePayload Create(PayloadData payload)
+		public static InitialHandshakePayload Create(ReadOnlySpan<byte> span)
 		{
-			var reader = new ByteArrayReader(payload.ArraySegment);
+			var reader = new ByteArrayReader(span);
 			reader.ReadByte(c_protocolVersion);
 			var serverVersion = reader.ReadNullTerminatedByteString();
 			var connectionId = reader.ReadInt32();
-			byte[] authPluginData = null;
+			byte[]? authPluginData = null;
 			var authPluginData1 = reader.ReadByteString(8);
-			string authPluginName = null;
+			string? authPluginName = null;
 			reader.ReadByte(0);
 			var protocolCapabilities = (ProtocolCapabilities) reader.ReadUInt16();
 			if (reader.BytesRemaining > 0)
 			{
-				var charSet = (CharacterSet) reader.ReadByte();
-				var status = (ServerStatus) reader.ReadInt16();
+				var charSet = (CharacterSet) reader.ReadByte(); // lgtm[cs/useless-assignment-to-local]
+				var status = (ServerStatus) reader.ReadInt16(); // lgtm[cs/useless-assignment-to-local]
 				var capabilityFlagsHigh = reader.ReadUInt16();
-				protocolCapabilities |= (ProtocolCapabilities) (capabilityFlagsHigh << 16);
+				protocolCapabilities |= (ProtocolCapabilities) ((ulong) capabilityFlagsHigh << 16);
 				var authPluginDataLength = reader.ReadByte();
-				var unused = reader.ReadByteString(10);
+				reader.Offset += 6;
+
+				long extendedCapabilites = reader.ReadInt32();
+				if ((protocolCapabilities & ProtocolCapabilities.LongPassword) == 0)
+				{
+					// MariaDB clears the CLIENT_LONG_PASSWORD flag to indicate it's not a MySQL Server
+					protocolCapabilities |= (ProtocolCapabilities) (extendedCapabilites << 32);
+				}
+
 				if ((protocolCapabilities & ProtocolCapabilities.SecureConnection) != 0)
 				{
 					var authPluginData2 = reader.ReadByteString(Math.Max(13, authPluginDataLength - 8));
@@ -42,8 +50,7 @@ namespace MySqlConnector.Protocol.Payloads
 				if ((protocolCapabilities & ProtocolCapabilities.PluginAuth) != 0)
 					authPluginName = Encoding.UTF8.GetString(reader.ReadNullOrEofTerminatedByteString());
 			}
-			if (authPluginData == null)
-				authPluginData = authPluginData1.ToArray();
+			authPluginData ??= authPluginData1.ToArray();
 
 			if (reader.BytesRemaining != 0)
 				throw new FormatException("Extra bytes at end of payload.");
@@ -51,7 +58,7 @@ namespace MySqlConnector.Protocol.Payloads
 			return new InitialHandshakePayload(protocolCapabilities, serverVersion.ToArray(), connectionId, authPluginData, authPluginName);
 		}
 
-		private InitialHandshakePayload(ProtocolCapabilities protocolCapabilities, byte[] serverVersion, int connectionId, byte[] authPluginData, string authPluginName)
+		private InitialHandshakePayload(ProtocolCapabilities protocolCapabilities, byte[] serverVersion, int connectionId, byte[] authPluginData, string? authPluginName)
 		{
 			ProtocolCapabilities = protocolCapabilities;
 			ServerVersion = serverVersion;

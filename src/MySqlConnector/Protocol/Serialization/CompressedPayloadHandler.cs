@@ -33,22 +33,22 @@ namespace MySqlConnector.Protocol.Serialization
 
 		public IByteHandler ByteHandler
 		{
-			get => m_byteHandler;
+			get => m_byteHandler!;
 			set => throw new NotSupportedException();
 		}
 
 		public ValueTask<ArraySegment<byte>> ReadPayloadAsync(ArraySegmentHolder<byte> cache, ProtocolErrorBehavior protocolErrorBehavior, IOBehavior ioBehavior)
 		{
-			using (var compressedByteHandler = new CompressedByteHandler(this, protocolErrorBehavior))
-				return ProtocolUtility.ReadPayloadAsync(m_bufferedByteReader, compressedByteHandler, () => -1, cache, protocolErrorBehavior, ioBehavior);
+			using var compressedByteHandler = new CompressedByteHandler(this, protocolErrorBehavior);
+			return ProtocolUtility.ReadPayloadAsync(m_bufferedByteReader, compressedByteHandler, () => -1, cache, protocolErrorBehavior, ioBehavior);
 		}
 
-		public ValueTask<int> WritePayloadAsync(ArraySegment<byte> payload, IOBehavior ioBehavior)
+		public ValueTask<int> WritePayloadAsync(ReadOnlyMemory<byte> payload, IOBehavior ioBehavior)
 		{
 			// break the payload up into (possibly more than one) uncompressed packets
-			return ProtocolUtility.WritePayloadAsync(m_uncompressedStreamByteHandler, GetNextUncompressedSequenceNumber, payload, ioBehavior).ContinueWith(_ =>
+			return ProtocolUtility.WritePayloadAsync(m_uncompressedStreamByteHandler!, GetNextUncompressedSequenceNumber, payload, ioBehavior).ContinueWith(_ =>
 			{
-				if (m_uncompressedStream.Length == 0)
+				if (m_uncompressedStream!.Length == 0)
 					return default(ValueTask<int>);
 
 				if (!m_uncompressedStream.TryGetBuffer(out var uncompressedData))
@@ -64,19 +64,19 @@ namespace MySqlConnector.Protocol.Serialization
 			});
 		}
 
-		private ValueTask<int> ReadBytesAsync(ArraySegment<byte> buffer, ProtocolErrorBehavior protocolErrorBehavior, IOBehavior ioBehavior)
+		private ValueTask<int> ReadBytesAsync(Memory<byte> buffer, ProtocolErrorBehavior protocolErrorBehavior, IOBehavior ioBehavior)
 		{
 			// satisfy the read from cache if possible
 			if (m_remainingData.Count > 0)
 			{
-				var bytesToRead = Math.Min(m_remainingData.Count, buffer.Count);
-				Buffer.BlockCopy(m_remainingData.Array, m_remainingData.Offset, buffer.Array, buffer.Offset, bytesToRead);
+				var bytesToRead = Math.Min(m_remainingData.Count, buffer.Length);
+				m_remainingData.AsSpan().Slice(0, bytesToRead).CopyTo(buffer.Span);
 				m_remainingData = m_remainingData.Slice(bytesToRead);
 				return new ValueTask<int>(bytesToRead);
 			}
 
 			// read the compressed header (seven bytes)
-			return m_compressedBufferedByteReader.ReadBytesAsync(m_byteHandler, 7, ioBehavior)
+			return m_compressedBufferedByteReader.ReadBytesAsync(m_byteHandler!, 7, ioBehavior)
 				.ContinueWith(headerReadBytes =>
 				{
 					if (headerReadBytes.Count < 7)
@@ -86,8 +86,8 @@ namespace MySqlConnector.Protocol.Serialization
 							ValueTaskExtensions.FromException<int>(new EndOfStreamException("Wanted to read 7 bytes but only read {0} when reading compressed packet header".FormatInvariant(headerReadBytes.Count)));
 					}
 
-					var payloadLength = (int) SerializationUtility.ReadUInt32(headerReadBytes.Array, headerReadBytes.Offset, 3);
-					int packetSequenceNumber = headerReadBytes.Array[headerReadBytes.Offset + 3];
+					var payloadLength = (int) SerializationUtility.ReadUInt32(headerReadBytes.Array!, headerReadBytes.Offset, 3);
+					int packetSequenceNumber = headerReadBytes.Array![headerReadBytes.Offset + 3];
 					var uncompressedLength = (int) SerializationUtility.ReadUInt32(headerReadBytes.Array, headerReadBytes.Offset + 4, 3);
 
 					// verify the compressed packet sequence number
@@ -111,7 +111,7 @@ namespace MySqlConnector.Protocol.Serialization
 					// except this doesn't happen when uncompressed packets need to be broken up across multiple compressed packets
 					m_isContinuationPacket = payloadLength == ProtocolUtility.MaxPacketSize || uncompressedLength == ProtocolUtility.MaxPacketSize;
 
-					return m_compressedBufferedByteReader.ReadBytesAsync(m_byteHandler, payloadLength, ioBehavior)
+					return m_compressedBufferedByteReader.ReadBytesAsync(m_byteHandler!, payloadLength, ioBehavior)
 						.ContinueWith(payloadReadBytes =>
 						{
 							if (payloadReadBytes.Count < payloadLength)
@@ -129,7 +129,7 @@ namespace MySqlConnector.Protocol.Serialization
 							else
 							{
 								// check CMF (Compression Method and Flags) and FLG (Flags) bytes for expected values
-								var cmf = payloadReadBytes.Array[payloadReadBytes.Offset];
+								var cmf = payloadReadBytes.Array![payloadReadBytes.Offset];
 								var flg = payloadReadBytes.Array[payloadReadBytes.Offset + 1];
 								if (cmf != 0x78 || ((flg & 0x40) == 0x40) || ((cmf * 256 + flg) % 31 != 0))
 								{
@@ -146,31 +146,28 @@ namespace MySqlConnector.Protocol.Serialization
 								const int headerSize = 2;
 								const int checksumSize = 4;
 								var uncompressedData = new byte[uncompressedLength];
-								using (var compressedStream = new MemoryStream(payloadReadBytes.Array, payloadReadBytes.Offset + headerSize, payloadReadBytes.Count - headerSize - checksumSize))
-								using (var decompressingStream = new DeflateStream(compressedStream, CompressionMode.Decompress))
-								{
-									var bytesRead = decompressingStream.Read(uncompressedData, 0, uncompressedLength);
-									m_remainingData = new ArraySegment<byte>(uncompressedData, 0, bytesRead);
+								using var compressedStream = new MemoryStream(payloadReadBytes.Array, payloadReadBytes.Offset + headerSize, payloadReadBytes.Count - headerSize - checksumSize);
+								using var decompressingStream = new DeflateStream(compressedStream, CompressionMode.Decompress);
+								var bytesRead = decompressingStream.Read(uncompressedData, 0, uncompressedLength);
+								m_remainingData = new ArraySegment<byte>(uncompressedData, 0, bytesRead);
 
-									var checksum = ComputeAdler32Checksum(uncompressedData, 0, bytesRead);
-									int adlerStartOffset = payloadReadBytes.Offset + payloadReadBytes.Count - 4;
-									if (payloadReadBytes.Array[adlerStartOffset + 0] != ((checksum >> 24) & 0xFF) ||
-									    payloadReadBytes.Array[adlerStartOffset + 1] != ((checksum >> 16) & 0xFF) ||
-									    payloadReadBytes.Array[adlerStartOffset + 2] != ((checksum >> 8) & 0xFF) ||
-									    payloadReadBytes.Array[adlerStartOffset + 3] != (checksum & 0xFF))
-									{
-										return protocolErrorBehavior == ProtocolErrorBehavior.Ignore ?
-											default(ValueTask<int>) :
-											ValueTaskExtensions.FromException<int>(new NotSupportedException("Invalid Adler-32 checksum of uncompressed data."));
-									}
+								var checksum = ComputeAdler32Checksum(uncompressedData, 0, bytesRead);
+								int adlerStartOffset = payloadReadBytes.Offset + payloadReadBytes.Count - 4;
+								if (payloadReadBytes.Array[adlerStartOffset + 0] != ((checksum >> 24) & 0xFF) ||
+									payloadReadBytes.Array[adlerStartOffset + 1] != ((checksum >> 16) & 0xFF) ||
+									payloadReadBytes.Array[adlerStartOffset + 2] != ((checksum >> 8) & 0xFF) ||
+									payloadReadBytes.Array[adlerStartOffset + 3] != (checksum & 0xFF))
+								{
+									return protocolErrorBehavior == ProtocolErrorBehavior.Ignore ?
+										default(ValueTask<int>) :
+										ValueTaskExtensions.FromException<int>(new NotSupportedException("Invalid Adler-32 checksum of uncompressed data."));
 								}
 							}
 
-							var bytesToRead = Math.Min(m_remainingData.Count, buffer.Count);
-							Buffer.BlockCopy(m_remainingData.Array, m_remainingData.Offset, buffer.Array, buffer.Offset, bytesToRead);
+							var bytesToRead = Math.Min(m_remainingData.Count, buffer.Length);
+							m_remainingData.AsSpan().Slice(0, bytesToRead).CopyTo(buffer.Span);
 							m_remainingData = m_remainingData.Slice(bytesToRead);
 							return new ValueTask<int>(bytesToRead);
-
 						});
 				});
 		}
@@ -187,31 +184,30 @@ namespace MySqlConnector.Protocol.Serialization
 			var compressedData = default(ArraySegment<byte>);
 			if (remainingUncompressedBytes > 80)
 			{
-				using (var compressedStream = new MemoryStream())
-				{
-					// write CMF: 32K window + deflate algorithm
-					compressedStream.WriteByte(0x78);
+				using var compressedStream = new MemoryStream();
 
-					// write FLG: maximum compression + checksum
-					compressedStream.WriteByte(0xDA);
+				// write CMF: 32K window + deflate algorithm
+				compressedStream.WriteByte(0x78);
 
-					using (var deflateStream = new DeflateStream(compressedStream, CompressionLevel.Optimal, leaveOpen: true))
-						deflateStream.Write(remainingUncompressedData.Array, remainingUncompressedData.Offset, remainingUncompressedBytes);
+				// write FLG: maximum compression + checksum
+				compressedStream.WriteByte(0xDA);
 
-					// write Adler-32 checksum to stream
-					var checksum = ComputeAdler32Checksum(remainingUncompressedData.Array, remainingUncompressedData.Offset, remainingUncompressedBytes);
-					compressedStream.WriteByte((byte) ((checksum >> 24) & 0xFF));
-					compressedStream.WriteByte((byte) ((checksum >> 16) & 0xFF));
-					compressedStream.WriteByte((byte) ((checksum >> 8) & 0xFF));
-					compressedStream.WriteByte((byte) (checksum & 0xFF));
+				using (var deflateStream = new DeflateStream(compressedStream, CompressionLevel.Optimal, leaveOpen: true))
+					deflateStream.Write(remainingUncompressedData.Array, remainingUncompressedData.Offset, remainingUncompressedBytes);
 
-					if (!compressedStream.TryGetBuffer(out compressedData))
-						throw new InvalidOperationException("Couldn't get compressed stream buffer.");
-				}
+				// write Adler-32 checksum to stream
+				var checksum = ComputeAdler32Checksum(remainingUncompressedData.Array!, remainingUncompressedData.Offset, remainingUncompressedBytes);
+				compressedStream.WriteByte((byte) ((checksum >> 24) & 0xFF));
+				compressedStream.WriteByte((byte) ((checksum >> 16) & 0xFF));
+				compressedStream.WriteByte((byte) ((checksum >> 8) & 0xFF));
+				compressedStream.WriteByte((byte) (checksum & 0xFF));
+
+				if (!compressedStream.TryGetBuffer(out compressedData))
+					throw new InvalidOperationException("Couldn't get compressed stream buffer.");
 			}
 
 			uint uncompressedLength = (uint) remainingUncompressedBytes;
-			if (compressedData.Array == null || compressedData.Count >= remainingUncompressedBytes)
+			if (compressedData.Array is null || compressedData.Count >= remainingUncompressedBytes)
 			{
 				// setting the length to 0 indicates sending uncompressed data
 				uncompressedLength = 0;
@@ -222,10 +218,10 @@ namespace MySqlConnector.Protocol.Serialization
 			SerializationUtility.WriteUInt32((uint) compressedData.Count, buffer, 0, 3);
 			buffer[3] = (byte) GetNextCompressedSequenceNumber();
 			SerializationUtility.WriteUInt32(uncompressedLength, buffer, 4, 3);
-			Buffer.BlockCopy(compressedData.Array, compressedData.Offset, buffer, 7, compressedData.Count);
+			Buffer.BlockCopy(compressedData.Array!, compressedData.Offset, buffer, 7, compressedData.Count);
 
 			remainingUncompressedData = remainingUncompressedData.Slice(remainingUncompressedBytes);
-			return m_byteHandler.WriteBytesAsync(new ArraySegment<byte>(buffer, 0, buffer.Length), ioBehavior)
+			return m_byteHandler!.WriteBytesAsync(new ArraySegment<byte>(buffer, 0, buffer.Length), ioBehavior)
 				.ContinueWith(_ => remainingUncompressedData.Count == 0 ? default(ValueTask<int>) :
 					CompressAndWrite(remainingUncompressedData, ioBehavior));
 		}
@@ -260,18 +256,18 @@ namespace MySqlConnector.Protocol.Serialization
 				set => m_compressedPayloadHandler.ByteHandler.RemainingTimeout = value;
 			}
 
-			public ValueTask<int> ReadBytesAsync(ArraySegment<byte> buffer, IOBehavior ioBehavior) =>
+			public ValueTask<int> ReadBytesAsync(Memory<byte> buffer, IOBehavior ioBehavior) =>
 				m_compressedPayloadHandler.ReadBytesAsync(buffer, m_protocolErrorBehavior, ioBehavior);
 
-			public ValueTask<int> WriteBytesAsync(ArraySegment<byte> data, IOBehavior ioBehavior) => throw new NotSupportedException();
+			public ValueTask<int> WriteBytesAsync(ReadOnlyMemory<byte> data, IOBehavior ioBehavior) => throw new NotSupportedException();
 
 			readonly CompressedPayloadHandler m_compressedPayloadHandler;
 			readonly ProtocolErrorBehavior m_protocolErrorBehavior;
 		}
 
-		MemoryStream m_uncompressedStream;
-		IByteHandler m_uncompressedStreamByteHandler;
-		IByteHandler m_byteHandler;
+		MemoryStream? m_uncompressedStream;
+		IByteHandler? m_uncompressedStreamByteHandler;
+		IByteHandler? m_byteHandler;
 		readonly BufferedByteReader m_bufferedByteReader;
 		readonly BufferedByteReader m_compressedBufferedByteReader;
 		int m_compressedSequenceNumber;

@@ -1,3 +1,4 @@
+using System.Data.Common;
 using MySql.Data.MySqlClient;
 using Xunit;
 
@@ -31,16 +32,41 @@ namespace SideBySide
 		}
 
 #if !NETCOREAPP1_1_2
-		[SkippableFact(Baseline = "https://bugs.mysql.com/bug.php?id=88660")]
+		[Fact]
 		public void CreateCommandBuilder()
 		{
 			Assert.IsType<MySqlCommandBuilder>(MySqlClientFactory.Instance.CreateCommandBuilder());
 		}
 
-		[SkippableFact(Baseline = "https://bugs.mysql.com/bug.php?id=88660")]
+		[Fact]
 		public void CreateDataAdapter()
 		{
 			Assert.IsType<MySqlDataAdapter>(MySqlClientFactory.Instance.CreateDataAdapter());
+		}
+#endif
+
+#if !NETCOREAPP1_1_2 && !NETCOREAPP2_0
+		[Fact]
+		public void DbProviderFactoriesGetFactory()
+		{
+#if !NET452 && !NET461 && !NET472
+			DbProviderFactories.RegisterFactory("MySqlConnector", MySqlClientFactory.Instance);
+#endif
+#if BASELINE
+			var providerInvariantName = "MySql.Data.MySqlClient";
+#else
+			var providerInvariantName = "MySqlConnector";
+#endif
+			var factory = DbProviderFactories.GetFactory(providerInvariantName);
+			Assert.NotNull(factory);
+			Assert.Same(MySqlClientFactory.Instance, factory);
+
+			using (var connection = new MySqlConnection())
+			{
+				factory = System.Data.Common.DbProviderFactories.GetFactory(connection);
+				Assert.NotNull(factory);
+				Assert.Same(MySqlClientFactory.Instance, factory);
+			}
 		}
 #endif
 	}
